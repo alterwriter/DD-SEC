@@ -1,0 +1,25 @@
+# Local dd-sec state (never commit credentials or audit logs)
+.config/
+credentials
+session.json
+audit/
+last-list.tsv
+
+# Generated reports
+*.report.md
+posture*.html
+posture*.json
+posture*.md
+weekly*.md
+
+# Local recast working files (keep the *.example.tsv template)
+recast.tsv
+recast.csv
+recast.json
+
+# OS / editor junk
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

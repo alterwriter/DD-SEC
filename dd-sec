@@ -1,0 +1,3463 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dd-sec - Datadog Security CLI. Pure bash.
+#
+# A terminal replacement for the parts of the Datadog Security dashboard that
+# a security engineer touches daily: findings, severity recasting, muting,
+# automation rules, Work Management items, and raw SAST violations.
+#
+#   dd-sec start        interactive menu - the only command worth memorising
+#   dd-sec <cmd> ...    direct invocation, for scripts and CI
+#
+# AUTHENTICATION IS LAZY. Nothing asks for a key until an action actually needs
+# one, and when it does the login runs inline and the action continues. There
+# is no separate "log in first" step to remember.
+#
+# Dependencies: bash 3.2+, curl, jq. No compile step, no runtime, one file.
+#
+# WHY API KEY + APP KEY AND NOT A BROWSER SESSION
+# Datadog has no OAuth device authorization flow. Its OAuth2 is for
+# Marketplace integrations: confidential clients with a client_secret, and
+# Datadog does not recommend initiating authorization outside the integration
+# tile. Reading the browser session instead would mean decrypting the cookie
+# jar (Keychain-wrapped AES on macOS, DPAPI on Windows), scraping x-csrf-token
+# out of the page HTML, and tracking x-web-ui-version across Datadog deploys.
+# That is fragile, and a script that decrypts browser cookies is
+# indistinguishable from an infostealer. App keys are revocable, scopable, and
+# attributable in the audit log. So: app keys.
+#
+# PERMISSIONS, BY FEATURE
+#   findings, recast   security_monitoring_findings_read / _write
+#                      (appsec_vm_read / _write also satisfy these)
+#   mute               security_monitoring_findings_write or appsec_vm_write
+#   rules              security_pipelines_read / _write
+#   work items         cases_read / cases_write
+#   sast violations    code_analysis_read
+#                      This is the one governing the cicodescan track. Without
+#                      it the query returns 403 "User does not have permission
+#                      for track cicodescan", which reads like a bad endpoint
+#                      rather than a missing permission.
+# =============================================================================
+set -uo pipefail
+
+VERSION="1.1.0-beta.1"
+PROG="${0##*/}"
+
+CFG_DIR="${DD_SEC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/dd-sec}"
+CRED_FILE="$CFG_DIR/credentials"
+SESSION_FILE="$CFG_DIR/session.json"
+AUDIT_DIR="$CFG_DIR/audit"
+SESSION_TTL_SEC=43200   # 12h, then credentials are re-validated
+
+# Probed in this order when the site is not known. /api/v1/validate needs only
+# the API key, so this costs one cheap request per site and runs once.
+SITES="datadoghq.com us5.datadoghq.com us3.datadoghq.com datadoghq.eu ap1.datadoghq.com ap2.datadoghq.com uk1.datadoghq.com ddog-gov.com us2.ddog-gov.com"
+
+# Severity adjustment in the UI caps bulk selection at 50 findings; the mute
+# endpoint documents 100. Both batch at their own limit.
+BATCH_SEVERITY=50
+BATCH_MUTE=100
+
+# The logs-analytics endpoint is UNDOCUMENTED, so its server-side ceiling for
+# `limit` is unknown and not guaranteed stable. This number is operational, not
+# verified. Truncation is detected rather than assumed away - see dd_cicodescan.
+SAST_QUERY_LIMIT="${SAST_QUERY_LIMIT:-5000}"
+SAST_LOOKBACK_DAYS="${SAST_LOOKBACK_DAYS:-30}"
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'
+  C_BLU=$'\033[34m'; C_CYN=$'\033[36m'; C_BLD=$'\033[1m'
+  C_DIM=$'\033[2m';  C_OFF=$'\033[0m'
+else
+  C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_CYN=""; C_BLD=""; C_DIM=""; C_OFF=""
+fi
+
+info() { printf '%s\n' "$*" >&2; }
+step() { printf '%s→%s %s\n' "$C_BLU" "$C_OFF" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_GRN" "$C_OFF" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$C_YLW" "$C_OFF" "$*" >&2; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
+hdr()  { printf '\n%s%s%s\n' "$C_BLD" "$*" "$C_OFF" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+# In menu mode a failure must return to the menu, not kill the process. Every
+# action is therefore called through run_action, which downgrades `die` to a
+# message plus a non-zero return by running the action in a subshell.
+MENU_MODE=false
+run_action() {
+  if [ "$MENU_MODE" = true ]; then
+    ( "$@" ) || warn "Action failed. Returning to menu."
+    return 0
+  fi
+  "$@"
+}
+
+need_deps() {
+  local missing=""
+  command -v curl >/dev/null 2>&1 || missing="$missing curl"
+  command -v jq   >/dev/null 2>&1 || missing="$missing jq"
+  [ -z "$missing" ] || die "Dependency missing:$missing
+  macOS   : brew install jq
+  Debian  : sudo apt install jq
+  Windows : scoop install jq  (or use WSL)"
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum | cut -c1-64; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 | cut -c1-64; }
+else
+  sha256() { cksum | tr -d ' \n'; }   # not cryptographic, only used for keys
+fi
+
+# -----------------------------------------------------------------------------
+# Secret store: macOS Keychain > libsecret > file with mode 600
+# -----------------------------------------------------------------------------
+keystore_kind() {
+  case "${DD_SEC_KEYSTORE:-auto}" in
+    file|keychain|secret) printf '%s' "$DD_SEC_KEYSTORE"; return ;;
+  esac
+  if [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+    printf 'keychain'
+  elif command -v secret-tool >/dev/null 2>&1; then
+    printf 'secret'
+  else
+    printf 'file'
+  fi
+}
+
+secret_put() {
+  case "$(keystore_kind)" in
+    keychain) security add-generic-password -U -a "$USER" -s "dd-sec:$1" -w "$2" >/dev/null 2>&1 || die "Failed to write to Keychain" ;;
+    secret)   printf '%s' "$2" | secret-tool store --label="dd-sec $1" service dd-sec key "$1" >/dev/null 2>&1 || die "Failed to write to libsecret" ;;
+    file)
+      mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR" 2>/dev/null
+      touch "$CRED_FILE"; chmod 600 "$CRED_FILE"
+      local tmp; tmp="$(mktemp)"
+      grep -v "^$1=" "$CRED_FILE" 2>/dev/null > "$tmp"
+      printf '%s=%s\n' "$1" "$2" >> "$tmp"
+      mv "$tmp" "$CRED_FILE"; chmod 600 "$CRED_FILE" ;;
+  esac
+}
+
+secret_get() {
+  case "$(keystore_kind)" in
+    keychain) security find-generic-password -a "$USER" -s "dd-sec:$1" -w 2>/dev/null ;;
+    secret)   secret-tool lookup service dd-sec key "$1" 2>/dev/null ;;
+    file)     [ -f "$CRED_FILE" ] && sed -n "s/^$1=//p" "$CRED_FILE" | tail -1 ;;
+  esac
+}
+
+secret_del() {
+  case "$(keystore_kind)" in
+    keychain) security delete-generic-password -a "$USER" -s "dd-sec:$1" >/dev/null 2>&1 ;;
+    secret)   secret-tool clear service dd-sec key "$1" >/dev/null 2>&1 ;;
+    file)
+      if [ -f "$CRED_FILE" ]; then
+        local tmp; tmp="$(mktemp)"
+        grep -v "^$1=" "$CRED_FILE" > "$tmp" 2>/dev/null
+        mv "$tmp" "$CRED_FILE"; chmod 600 "$CRED_FILE"
+      fi ;;
+  esac
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Site and URL shapes.
+# The API host is always api.<site>. The APP host is not: US1 and EU prefix
+# with "app.", while regional sites (us3, us5, ap1) are their own hostname.
+# -----------------------------------------------------------------------------
+api_base() { printf 'https://api.%s' "$1"; }
+app_base() {
+  case "$1" in
+    datadoghq.com|datadoghq.eu|ddog-gov.com) printf 'https://app.%s' "$1" ;;
+    *)                                       printf 'https://%s' "$1" ;;
+  esac
+}
+
+open_url() {
+  local url="$1"
+  if   command -v open           >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 &
+  elif command -v xdg-open       >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v powershell.exe >/dev/null 2>&1; then powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1 &
+  elif command -v cmd.exe        >/dev/null 2>&1; then cmd.exe /c start "" "$url" >/dev/null 2>&1 &
+  else warn "Open manually: $url"; return 1; fi
+  return 0
+}
+
+urlencode() { printf '%s' "$1" | jq -sRr @uri; }
+
+# -----------------------------------------------------------------------------
+# HTTP
+#   dd_req METHOD PATH [BODY] [SITE] [API_KEY] [APP_KEY]
+# Sets HTTP_CODE, HTTP_BODY, RL_REMAINING, RL_RESET. Returns 0 on 2xx only.
+# -----------------------------------------------------------------------------
+HTTP_CODE=""; HTTP_BODY=""; RL_REMAINING=""; RL_RESET=""
+
+dd_req() {
+  local method="$1" path="$2" body="${3:-}"
+  local site="${4:-${DD_SITE_R:-}}" ak="${5:-${DD_API_KEY_R:-}}" pk="${6:-${DD_APP_KEY_R:-}}"
+  local hdr; hdr="$(mktemp)"
+  local url; url="$(api_base "$site")$path"
+
+  set -- -sS -X "$method" -D "$hdr" -o /dev/stdout -w '\n%{http_code}' \
+         --connect-timeout 10 --max-time 120 \
+         -H "DD-API-KEY: $ak" -H "DD-APPLICATION-KEY: $pk" \
+         -H "Accept: application/json" -H "User-Agent: dd-sec/$VERSION"
+  [ -z "$body" ] || set -- "$@" -H "Content-Type: application/json" --data-binary "$body"
+
+  local raw; raw="$(curl "$@" "$url" 2>/dev/null)"
+  HTTP_CODE="${raw##*$'\n'}"
+  HTTP_BODY="${raw%$'\n'*}"
+  RL_REMAINING="$(sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]emaining: *//p' "$hdr" | tr -d '\r' | tail -1)"
+  RL_RESET="$(sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]eset: *//p' "$hdr" | tr -d '\r' | tail -1)"
+  rm -f "$hdr"
+  [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
+  case "$HTTP_CODE" in 2*) return 0 ;; *) return 1 ;; esac
+}
+
+# Retries 429 using x-ratelimit-reset, and 5xx / connection failures with a
+# linear backoff. A 4xx other than 429 is returned immediately: retrying a
+# validation error just wastes time.
+dd_req_retry() {
+  local attempt=1 max=5 wait
+  while :; do
+    dd_req "$@" && return 0
+    case "$HTTP_CODE" in
+      429)
+        wait="${RL_RESET:-}"
+        case "$wait" in ''|*[!0-9]*) wait=$(( attempt * 5 )) ;; esac
+        [ "$wait" -gt 120 ] && wait=120
+        warn "Rate limited, waiting ${wait}s (${attempt}/${max})"; sleep "$wait" ;;
+      5*|000)
+        wait=$(( attempt * 3 ))
+        warn "HTTP $HTTP_CODE, retry ${wait}s (${attempt}/${max})"; sleep "$wait" ;;
+      *) return 1 ;;
+    esac
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -le "$max" ] || return 1
+  done
+}
+
+api_error() {
+  printf '%s' "$HTTP_BODY" | jq -r '
+    (.errors // empty) as $e
+    | if ($e|type) == "array" then
+        ($e | map(if type=="object" then (.detail // .title // tostring) else tostring end) | join("; "))
+      else tostring end' 2>/dev/null \
+  || printf '%s' "$HTTP_BODY" | head -c 300
+}
+
+explain_http() {
+  case "$HTTP_CODE" in
+    401) warn "401 - API key or App key invalid for site ${DD_SITE_R:-?}." ;;
+    403) warn "403 - App key lacks permission for this endpoint. See this file's header for the per-feature permission mapping." ;;
+    404) warn "404 - resource not found, or endpoint not available in this org." ;;
+    *)   warn "HTTP $HTTP_CODE: $(api_error)" ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# cicodescan query (undocumented logs-analytics endpoint)
+#   dd_cicodescan QUERY OUTFILE [strict]
+#
+# strict=true (default) means the result MUST be complete and the call fails
+# closed when truncation is suspected. Two independent checks, because either
+# one alone has a blind spot:
+#   1. hitCount larger than the number of returned events proves data was left
+#      behind.
+#   2. a result exactly equal to the limit is indistinguishable from a
+#      truncated one, and check 1 is blind when the server truncates hitCount
+#      too. No server cap can be assumed on an undocumented endpoint.
+# strict=false is for existence probes, where completeness does not matter.
+# -----------------------------------------------------------------------------
+dd_cicodescan() {
+  local query="$1" out="$2" strict="${3:-true}" body code hit ret now t_from t_to
+  now="$(date -u +%s)"
+  t_from=$(( (now - SAST_LOOKBACK_DAYS * 86400) * 1000 ))
+  t_to=$(( (now + 3600) * 1000 ))
+
+  body="$(jq -nc --arg q "$query" --argjson from "$t_from" --argjson to "$t_to" \
+    --argjson lim "$SAST_QUERY_LIMIT" '{
+      list: { columns: [], sorts: [], limit: $lim,
+              time: {from: $from, to: $to},
+              search: {query: $q},
+              includeEvents: true, includeEventContents: true,
+              computeCount: true, indexes: ["*"], executionInfo: {} } }')"
+
+  code="$(curl -sS -X POST "$(api_base "$DD_SITE_R")/api/v1/logs-analytics/list?type=cicodescan" \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    -H "DD-API-KEY: ${DD_API_KEY_R}" -H "DD-APPLICATION-KEY: ${DD_APP_KEY_R}" \
+    --data "$body" --max-time 60 -o "$out" -w '%{http_code}')" || {
+      warn "curl could not reach the logs-analytics endpoint"; return 1; }
+
+  if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+    warn "HTTP ${code} from logs-analytics"
+    head -c 300 "$out" >&2; printf '\n' >&2
+    if [ "$code" = "403" ]; then
+      dim "  a 403 here usually means the App key lacks 'code_analysis_read'"
+      dim "  (Code Analysis Read), the permission that governs the cicodescan track."
+      dim "  Check DD_SITE too: a key from another site is rejected with the same status."
+    fi
+    return 1
+  fi
+
+  # Shape validation. The endpoint is undocumented, so a structural change must
+  # be loud rather than read as "zero findings".
+  if ! jq -e '.result | (.events | type) == "array"' "$out" >/dev/null 2>&1; then
+    warn "Unrecognized response shape: .result.events is not an array."
+    dim "  The endpoint may have changed. Do not trust this result."
+    return 1
+  fi
+
+  hit="$(jq -r '.hitCount // 0' "$out")"
+  ret="$(jq -r '.result.events | length' "$out")"
+  [ "$strict" = "true" ] || return 0
+
+  if [ "$hit" -gt "$ret" ]; then
+    warn "hitCount=${hit} but only ${ret} events returned - result truncated."
+    dim "  Raise SAST_QUERY_LIMIT (currently ${SAST_QUERY_LIMIT}). Fail closed."
+    return 1
+  fi
+  if [ "$ret" -ge "$SAST_QUERY_LIMIT" ]; then
+    warn "Event count (${ret}) equals SAST_QUERY_LIMIT - possibly truncated."
+    dim "  Raise the limit and retry. If the number does not grow, that is the"
+    dim "  server ceiling, and the query must be narrowed. Fail closed."
+    return 1
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Session
+# -----------------------------------------------------------------------------
+DD_SITE_R=""; DD_API_KEY_R=""; DD_APP_KEY_R=""
+SEV_MODE=""; ORG_NAME=""; PROJECT_ID=""
+
+session_field() { [ -f "$SESSION_FILE" ] && jq -r --arg k "$1" '.[$k] // ""' "$SESSION_FILE" 2>/dev/null; }
+
+session_set() { # key value
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR" 2>/dev/null
+  local tmp; tmp="$(mktemp)"
+  if [ -f "$SESSION_FILE" ]; then
+    jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$SESSION_FILE" > "$tmp" 2>/dev/null \
+      || jq -n --arg k "$1" --arg v "$2" '{($k): $v}' > "$tmp"
+  else
+    jq -n --arg k "$1" --arg v "$2" '{($k): $v}' > "$tmp"
+  fi
+  mv "$tmp" "$SESSION_FILE"; chmod 600 "$SESSION_FILE"
+}
+
+session_age() {
+  local ts; ts="$(session_field validated_at)"
+  case "$ts" in ''|*[!0-9]*) echo 999999; return ;; esac
+  echo $(( $(date +%s) - ts ))
+}
+
+load_creds() {
+  DD_API_KEY_R="${DD_API_KEY:-$(secret_get DD_API_KEY)}"
+  DD_APP_KEY_R="${DD_APP_KEY:-$(secret_get DD_APP_KEY)}"
+  DD_SITE_R="${DD_SITE:-$(session_field site)}"
+  [ -n "$DD_SITE_R" ] || DD_SITE_R="$(secret_get DD_SITE)"
+  SEV_MODE="$(session_field severity_mode)"
+  ORG_NAME="$(session_field org)"
+  PROJECT_ID="${DD_CASES_PROJECT_ID:-$(session_field project_id)}"
+}
+
+# LAZY AUTH. This is the whole point of `dd-sec start`: an action calls
+# need_auth, and if there is no usable session the login happens right here and
+# the action carries on. Nothing has to be run beforehand.
+need_auth() {
+  load_creds
+  if [ -z "$DD_API_KEY_R" ] || [ -z "$DD_APP_KEY_R" ] || [ -z "$DD_SITE_R" ]; then
+    if [ -t 0 ]; then
+      hdr "Authentication required for this action"
+      cmd_auth_login || die "Login cancelled"
+      load_creds
+    else
+      die "Not logged in and no TTY. Set DD_API_KEY / DD_APP_KEY / DD_SITE, or run: $PROG auth login"
+    fi
+  fi
+  if [ "$(session_age)" -gt "$SESSION_TTL_SEC" ]; then
+    step "Session older than 12h, re-validating..."
+    if validate_creds "$DD_SITE_R"; then
+      session_set validated_at "$(date +%s)"
+    else
+      warn "Credentials no longer valid."
+      if [ -t 0 ]; then
+        cmd_auth_login || die "Login cancelled"; load_creds
+      else
+        die "Run: $PROG auth login"
+      fi
+    fi
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Validation and capability probing
+# -----------------------------------------------------------------------------
+detect_site() {
+  local s
+  for s in $SITES; do
+    if dd_req GET /api/v1/validate "" "$s" "$DD_API_KEY_R" "$DD_APP_KEY_R"; then
+      if [ "$(printf '%s' "$HTTP_BODY" | jq -r '.valid // false' 2>/dev/null)" = "true" ]; then
+        printf '%s' "$s"; return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# Exercises the app key on the endpoint the tool actually needs, not on a
+# generic one: a key can validate and still lack findings access.
+validate_creds() {
+  local s="$1"
+  if ! dd_req GET '/api/v2/security/findings?page%5Blimit%5D=1' "" "$s"; then
+    explain_http; return 1
+  fi
+  ORG_NAME="$(printf '%s' "$HTTP_BODY" | jq -r '.meta.org_name // ""' 2>/dev/null)"
+  [ -n "$ORG_NAME" ] || ORG_NAME="(unknown)"
+  return 0
+}
+
+# Is PATCH /api/v2/security/findings/severity reachable with key auth?
+# The probe sends an EMPTY findings list. A 4xx validation error means auth
+# passed and the handler was reached; 401/403 means it was not. Nothing is
+# mutated on either path, which is why this is safe to run at login.
+probe_severity_mode() {
+  local probe='{"data":{"type":"severity_override","attributes":{"severity":{"action":"set","value":"high"}},"relationships":{"findings":{"data":[]}}}}'
+  dd_req PATCH /api/v2/security/findings/severity "$probe"
+  case "$HTTP_CODE" in
+    2*|400|404|409|422) printf 'direct' ;;
+    401|403)            printf 'rule'   ;;
+    *)                  printf 'unknown' ;;
+  esac
+}
+
+self_principal() {
+  dd_req GET /api/v2/current_user >/dev/null 2>&1 || return 1
+  printf '%s' "$HTTP_BODY" | jq -r '.data.id // empty' 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# auth
+# -----------------------------------------------------------------------------
+read_secret() {
+  local p="$1" v=""
+  printf '%s' "$p" >&2
+  [ -t 0 ] && stty -echo 2>/dev/null
+  IFS= read -r v
+  [ -t 0 ] && { stty echo 2>/dev/null; printf '\n' >&2; }
+  printf '%s' "$v"
+}
+
+cmd_auth_login() {
+  local mode="" site_in="" ak="" pk=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) mode="$2"; shift 2 ;;
+      --site) site_in="$2"; shift 2 ;;
+      --api-key) ak="$2"; shift 2 ;;
+      --app-key) pk="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+
+  if [ -z "$mode" ]; then
+    if   [ -n "$ak" ] && [ -n "$pk" ]; then mode=manual
+    elif [ -n "${DD_API_KEY:-}" ] && [ -n "${DD_APP_KEY:-}" ]; then mode=env
+    elif [ -t 0 ]; then
+      info ""
+      info "  1) Browser  - open Datadog, create a key, paste it back"
+      info "  2) Manual   - paste an existing API Key + App Key"
+      info "  3) Env      - use DD_API_KEY / DD_APP_KEY from the environment"
+      info ""
+      printf '  Select [1-3]: ' >&2
+      local pick; IFS= read -r pick || return 1
+      case "$pick" in
+        1) mode=browser ;; 2) mode=manual ;; 3) mode=env ;;
+        *) warn "Invalid choice"; return 1 ;;
+      esac
+    else
+      die "Non-interactive: use --api-key/--app-key or set DD_API_KEY/DD_APP_KEY"
+    fi
+  fi
+
+  case "$mode" in
+    env)
+      ak="${DD_API_KEY:-}"; pk="${DD_APP_KEY:-}"
+      [ -n "$ak" ] && [ -n "$pk" ] || die "DD_API_KEY / DD_APP_KEY not set" ;;
+    browser)
+      local ui="${site_in:-${DD_SITE:-datadoghq.com}}"
+      local kurl aurl
+      aurl="$(app_base "$ui")/organization-settings/api-keys"
+      kurl="$(app_base "$ui")/organization-settings/application-keys"
+      info ""
+      step "Opening the API Keys & Application Keys pages"
+      dim "  Log in / SSO first if needed, then 'New Key' and copy."
+      open_url "$aurl"; sleep 1; open_url "$kurl"
+      info ""
+      dim "  API Key : $aurl"
+      dim "  App Key : $kurl"
+      info ""
+      [ -n "$ak" ] || ak="$(read_secret '  Paste API Key : ')"
+      [ -n "$pk" ] || pk="$(read_secret '  Paste App Key : ')" ;;
+    manual)
+      [ -n "$ak" ] || ak="$(read_secret '  API Key : ')"
+      [ -n "$pk" ] || pk="$(read_secret '  App Key : ')" ;;
+    *) die "Unknown mode: $mode" ;;
+  esac
+
+  ak="$(printf '%s' "$ak" | tr -d '[:space:]')"
+  pk="$(printf '%s' "$pk" | tr -d '[:space:]')"
+  [ -n "$ak" ] && [ -n "$pk" ] || { warn "Empty key"; return 1; }
+  DD_API_KEY_R="$ak"; DD_APP_KEY_R="$pk"
+
+  local site="${site_in:-${DD_SITE:-}}"
+  if [ -n "$site" ]; then
+    step "Site set manually: $site"
+  else
+    step "Detecting site..."
+    site="$(detect_site)" || die "Site not detected. Check the API key, or set --site.
+  Valid sites: $SITES"
+    ok "Site: $site"
+  fi
+  DD_SITE_R="$site"
+
+  step "Validating credentials (findings:read)..."
+  validate_creds "$site" || return 1
+  ok "Org: $ORG_NAME"
+
+  step "Probing severity capability..."
+  local m; m="$(probe_severity_mode)"
+  case "$m" in
+    direct) ok "Per-finding recast available (mode: direct)" ;;
+    rule)   warn "Per-finding recast denied (HTTP $HTTP_CODE) - falling back to severity modifier rules (mode: rule)" ;;
+    *)      warn "Ambiguous probe (HTTP $HTTP_CODE) - mode: unknown" ;;
+  esac
+
+  if [ "$mode" != "env" ]; then
+    secret_put DD_API_KEY "$ak"; secret_put DD_APP_KEY "$pk"; secret_put DD_SITE "$site"
+    dim "  Credentials stored via keystore: $(keystore_kind)"
+  else
+    dim "  Env mode: credentials NOT written to disk"
+  fi
+
+  session_set site "$site"; session_set org "$ORG_NAME"
+  session_set severity_mode "$m"; session_set validated_at "$(date +%s)"
+  SEV_MODE="$m"
+  ok "Session active (TTL 12h)"
+}
+
+cmd_auth_status() {
+  load_creds
+  if [ -z "$DD_API_KEY_R" ] || [ -z "$DD_APP_KEY_R" ]; then
+    info "Status   : not logged in"
+    info "Keystore : $(keystore_kind)"
+    return 0
+  fi
+  local age; age="$(session_age)"
+  info "Status        : logged in"
+  info "Site          : ${DD_SITE_R:-?}"
+  info "Org           : ${ORG_NAME:-?}"
+  info "Severity mode : ${SEV_MODE:-?}"
+  info "WM project    : ${PROJECT_ID:-<not selected>}"
+  info "Keystore      : $(keystore_kind)"
+  info "API key       : ...${DD_API_KEY_R: -4}"
+  info "App key       : ...${DD_APP_KEY_R: -4}"
+  if [ "$age" -gt "$SESSION_TTL_SEC" ]; then
+    info "Session age   : $((age/3600))h (expired, will re-validate)"
+  else
+    info "Session age   : $((age/60))m"
+  fi
+}
+
+cmd_auth_logout() {
+  secret_del DD_API_KEY; secret_del DD_APP_KEY; secret_del DD_SITE
+  rm -f "$SESSION_FILE"
+  ok "Local credentials & session deleted"
+  dim "  This does NOT revoke the key in Datadog. Revoke at:"
+  dim "  $(app_base "${DD_SITE_R:-datadoghq.com}")/organization-settings/application-keys"
+}
+
+# Probes every feature's permission in one pass, so a 403 later is never a
+# surprise. Each line is a real request against the endpoint that feature uses.
+cmd_auth_probe() {
+  need_auth
+  hdr "Permission probe - org ${ORG_NAME:-?} @ ${DD_SITE_R}"
+
+  local me; me="$(self_principal || true)"
+  [ -z "$me" ] || info "  identity            : user:${me}"
+
+  printf '  findings:read       : ' >&2
+  if dd_req GET '/api/v2/security/findings?page%5Blimit%5D=1'; then printf '%sOK%s\n' "$C_GRN" "$C_OFF" >&2
+  else printf '%sHTTP %s%s\n' "$C_RED" "$HTTP_CODE" "$C_OFF" >&2; fi
+
+  printf '  severity:write      : ' >&2
+  local m; m="$(probe_severity_mode)"
+  case "$m" in
+    direct) printf '%sdirect%s (per-finding recast active)\n' "$C_GRN" "$C_OFF" >&2 ;;
+    rule)   printf '%srule%s (HTTP %s - using severity modifier rules)\n' "$C_YLW" "$C_OFF" "$HTTP_CODE" >&2 ;;
+    *)      printf '%sunknown%s (HTTP %s)\n' "$C_YLW" "$C_OFF" "$HTTP_CODE" >&2 ;;
+  esac
+  session_set severity_mode "$m"
+
+  printf '  pipelines:read      : ' >&2
+  if dd_req GET /api/v2/security/findings/automation/severity_modifier_rules; then
+    printf '%sOK%s (%s rule)\n' "$C_GRN" "$C_OFF" "$(printf '%s' "$HTTP_BODY" | jq -r '.data|length')" >&2
+  else printf '%sHTTP %s%s\n' "$C_RED" "$HTTP_CODE" "$C_OFF" >&2; fi
+
+  printf '  cases:read          : ' >&2
+  if dd_req GET '/api/v2/cases/projects'; then
+    printf '%sOK%s (%s project)\n' "$C_GRN" "$C_OFF" "$(printf '%s' "$HTTP_BODY" | jq -r '.data|length')" >&2
+  else printf '%sHTTP %s%s\n' "$C_RED" "$HTTP_CODE" "$C_OFF" >&2; fi
+
+  printf '  code_analysis_read  : ' >&2
+  local t; t="$(mktemp)"
+  if dd_cicodescan '@static_analysis.result.item_type:static_analysis_violation' "$t" false >/dev/null 2>&1; then
+    printf '%sOK%s\n' "$C_GRN" "$C_OFF" >&2
+  else printf '%sfailed%s (see message above)\n' "$C_RED" "$C_OFF" >&2; fi
+  rm -f "$t"
+  info ""
+}
+
+# -----------------------------------------------------------------------------
+# findings
+#
+# FIELD DISCOVERY, NOT FIELD GUESSING
+# The attribute shape of /api/v2/security/findings differs by finding type:
+# a posture-management finding carries `evaluation` where a code-security one
+# carries a severity object, and neither layout is guaranteed across org
+# configurations. Hardcoding one path is how every row ended up as
+# "UNKNOWN ? ?".
+#
+# So extraction runs in two stages. First a list of known candidate paths, in
+# preference order. If every one of them misses, a DEEP SEARCH walks the whole
+# attributes object for any scalar under a key named severity / status / name,
+# which survives a layout this code has never seen. When even that misses, the
+# caller says so out loud and points at `findings keys`, rather than printing a
+# screen of question marks as if that were the data.
+# -----------------------------------------------------------------------------
+
+# jq program shared by the table view. Emits TSV:
+#   id, severity, status, title, resource
+FINDINGS_JQ='
+  # First non-empty string from a list of candidates.
+  def pick(c): [ c ] | map(select(type == "string" and . != "" and . != "null")) | (.[0] // "");
+  # Deep search: any scalar whose key matches, anywhere under the object.
+  def deep($re): [ .. | objects | to_entries[]
+                   | select(.key | test($re))
+                   | .value | select(type == "string" and . != "") ] | (.[0] // "");
+
+  .data[]? | . as $f | (.attributes // {}) as $a |
+  [ ($f.id? // ""),
+
+    ( pick( $a.severity?, $a.severity_details?.adjusted?.value?,
+            $a.severity_details?.original?.value?, $a.severity_details?.value?,
+            $a.vulnerability?.severity?, $a.finding?.severity?, $a.k9_severity? )
+      | if . == "" then ($a | deep("^(k9_)?severity$")) else . end ),
+
+    ( pick( $a.status?, $a.state?, $a.evaluation?, $a.finding_status? )
+      | if . == "" then ($a | deep("^(status|evaluation)$")) else . end ),
+
+    ( pick( $a.rule?.name?, $a.rule_name?, $a.vulnerability?.title?, $a.title?,
+            $a.message?, $a.rule?.id?, $a.finding_type?, $a.vulnerability_type? )
+      | if . == "" then ($a | deep("^(name|title|rule_id)$")) else . end ),
+
+    ( pick( $a.resource?, $a.location?.file_path?, $a.location?.file?,
+            $a.git?.repository?.name?, $a.repository?.name?, $a.service?,
+            $a.resource_type?, $a.high_level_resource_type? ) )
+  ] | @tsv'
+
+findings_fetch() { # query max
+  local query="$1" max="${2:-500}" cursor="" got=0 page=1 qs limit n
+  while :; do
+    limit=$(( max - got )); [ "$limit" -gt 150 ] && limit=150
+    [ "$limit" -le 0 ] && break
+    qs="page%5Blimit%5D=$limit"
+    [ -n "$query" ]  && qs="$qs&filter%5Bquery%5D=$(urlencode "$query")"
+    [ -n "$cursor" ] && qs="$qs&page%5Bcursor%5D=$(urlencode "$cursor")"
+
+    dd_req_retry GET "/api/v2/security/findings?$qs" || { explain_http; return 1; }
+
+    printf '%s' "$HTTP_BODY" | jq -r "$FINDINGS_JQ"
+
+    n="$(printf '%s' "$HTTP_BODY" | jq -r '.data|length')"
+    got=$(( got + n ))
+    cursor="$(printf '%s' "$HTTP_BODY" | jq -r '.meta.page.cursor // ""')"
+    [ -n "$cursor" ] && [ "$cursor" != "null" ] && [ "$n" -gt 0 ] || break
+    page=$(( page + 1 ))
+    dim "  ...page $page (total $got)"
+  done
+}
+
+# Prints the real attribute layout of one finding, as dotted paths plus a
+# truncated value. This is the 30-second way to pin the paths in FINDINGS_JQ
+# against an actual org instead of arguing with the docs.
+cmd_findings_keys() {
+  need_auth
+  local query=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --query) query="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  local qs="page%5Blimit%5D=1"
+  [ -n "$query" ] && qs="$qs&filter%5Bquery%5D=$(urlencode "$query")"
+  dd_req_retry GET "/api/v2/security/findings?$qs" || { explain_http; return 1; }
+
+  if [ "$(printf '%s' "$HTTP_BODY" | jq -r '(.data // []) | length')" -eq 0 ]; then
+    warn "0 findings for this query; no shape to display."
+    return 0
+  fi
+
+  hdr "Attribute layout (finding pertama)"
+  printf '%s' "$HTTP_BODY" | jq -r '
+    .data[0] as $f
+    | ($f.attributes // {}) as $a
+    | [ paths(scalars) as $p
+        | { p: ($p | map(tostring) | join(".")),
+            v: ($a | getpath($p) | tostring | .[0:58]) } ]
+    | sort_by(.p)[]
+    | "  \(.p)\u0009= \(.v)"' 2>/dev/null \
+    | awk -F'\t' '{ printf "  %-46s %s\n", $1, $2 }' >&2
+  info ""
+  dim "  The columns to show in the table can be pinned in FINDINGS_JQ in this file."
+  dim "  If severity/status live at another path, add it to pick(...) there."
+}
+
+cmd_findings_list() {
+  need_auth
+  local query="" max=200 as_json=0 export_to=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --query)  query="$2"; shift 2 ;;
+      --limit)  max="$2"; shift 2 ;;
+      --json)   as_json=1; shift ;;
+      --export) export_to="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+
+  if [ "$as_json" -eq 1 ]; then
+    local qs="page%5Blimit%5D=150"
+    [ -n "$query" ] && qs="$qs&filter%5Bquery%5D=$(urlencode "$query")"
+    dd_req_retry GET "/api/v2/security/findings?$qs" || { explain_http; return 1; }
+    printf '%s\n' "$HTTP_BODY" | jq .
+    return 0
+  fi
+
+  local t; t="$(mktemp)"
+  findings_fetch "$query" "$max" > "$t" || { rm -f "$t"; return 1; }
+  local n; n="$(grep -c '[^[:space:]]' < "$t" || true)"
+  if [ "${n:-0}" -eq 0 ]; then
+    warn "0 findings. Query: ${query:-<empty>}"
+    rm -f "$t"; return 0
+  fi
+
+  # Sorted by descending severity so what matters is at the top of the screen,
+  # THEN cached in that order - the displayed number and the cache index have to
+  # be the same thing or "#3" means two different findings.
+  local ts; ts="$(mktemp)"
+  awk -F'\t' 'BEGIN{OFS="\t"}
+    { s=tolower($2); r=7
+      if      (s=="critical") r=1
+      else if (s=="high")     r=2
+      else if (s=="medium")   r=3
+      else if (s=="low")      r=4
+      else if (s=="info"||s=="none"||s=="info_none") r=5
+      else if (s=="")         r=6
+      print r, $0 }' "$t" \
+    | sort -t"$(printf '\t')" -k1,1n -s | cut -f2- > "$ts"
+  pick_write "$query" < "$ts"
+
+  # An export is a round trip: the ids are filled in, the human fills in the
+  # decision. TSV rather than CSV on purpose - finding names contain commas.
+  if [ -n "$export_to" ]; then
+    {
+      printf 'finding_id\ttarget_severity\treason\tcurrent_severity\tname\tresource\n'
+      awk -F'\t' 'BEGIN{OFS="\t"} { print $1, "", "", $2, $4, $5 }' "$ts"
+    } > "$export_to"
+    ok "$n findings exported to $export_to"
+    info ""
+    dim "  Fill target_severity and reason for the rows you want to change."
+    dim "  Rows with an EMPTY target_severity are skipped, so deleting rows is"
+    dim "  not needed. Then:"
+    dim "    $PROG recast bulk --file $export_to          # dry-run"
+    dim "    $PROG recast bulk --file $export_to --apply"
+    rm -f "$t" "$ts"; return 0
+  fi
+
+  hdr "$n finding"
+  # Empty cells render as "-" rather than "?": a dash reads as "not in the
+  # response", a question mark reads as "the tool is confused".
+  pick_rows \
+    | awk -F'\t' '{
+        sev = ($3 == "" ? "-" : toupper($3))
+        st  = ($4 == "" ? "-" : $4)
+        ti  = ($5 == "" ? "-" : $5)
+        rs  = ($6 == "" ? ""  : $6)
+        printf "  #%-4s %-9s %-10s %-40.40s %s\n", $1, sev, st, ti, rs }' >&2
+
+  # If NOT ONE row resolved a severity, the extraction paths are wrong for this
+  # org rather than the data being empty. Say that, instead of leaving a screen
+  # of dashes to be interpreted as a clean result.
+  local nosev
+  nosev="$(awk -F'\t' '$2 == "" { c++ } END { print c+0 }' "$t")"
+  info ""
+  if [ "$nosev" -eq "$n" ]; then
+    warn "Severity unreadable on ALL $n rows - the field path differs in this org."
+    dim "  Run this to see the real layout, then pin the path:"
+    dim "    $PROG findings keys ${query:+--query '$query'}"
+  elif [ "$nosev" -gt 0 ]; then
+    dim "  $nosev rows without severity (finding types that do not carry that field)."
+  fi
+  dim "  Recast by NUMBER, not ID - the ID never needs to be copied:"
+  dim "    $PROG recast pick --select 3 --to high --reason '...'"
+  dim "    $PROG recast pick --select 1,4,9  |  --select 2-10  |  --select all,!7"
+  dim "  Detail of one row (including the full ID)  : $PROG findings show 3"
+  dim "  Bulk review via file                       : add --export recast.tsv"
+  rm -f "$t" "$ts"
+}
+
+# -----------------------------------------------------------------------------
+# SELECTION CACHE
+#
+# A finding id is a 44-character opaque base64 string. It is the only thing the
+# API accepts, but that is no reason to make a person handle it: retyping one
+# from a terminal gives no confirmation of what is being changed, and a
+# single-character typo is almost always a 404 but not guaranteed to be - it
+# could resolve to a different real finding.
+#
+# So every `findings list` writes what it showed to a cache, numbered. The
+# person then works with "#3" and the id never leaves the machine.
+#
+# The cache stores the QUERY, not just the rows, because ids are not guaranteed
+# stable: a new scan produces new finding records, so a cache from 20 minutes
+# ago can point at something that no longer exists. Before anything is applied
+# the query is re-run and the selection is intersected with what is live now.
+# Whatever no longer matches is dropped and reported, never silently recast.
+# -----------------------------------------------------------------------------
+PICK_FILE="$CFG_DIR/last-list.tsv"
+
+pick_write() { # query < rows on stdin
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR" 2>/dev/null
+  {
+    printf '#query\t%s\n' "$1"
+    printf '#fetched_at\t%s\n' "$(date +%s)"
+    awk -F'\t' 'BEGIN{OFS="\t"} { print NR, $0 }'
+  } > "$PICK_FILE"
+  chmod 600 "$PICK_FILE"
+}
+
+pick_query()   { [ -f "$PICK_FILE" ] && sed -n 's/^#query\t//p' "$PICK_FILE" | head -1; }
+pick_fetched() { [ -f "$PICK_FILE" ] && sed -n 's/^#fetched_at\t//p' "$PICK_FILE" | head -1; }
+pick_rows()    { [ -f "$PICK_FILE" ] && grep -v '^#' "$PICK_FILE"; }
+pick_count()   { pick_rows | grep -c '[^[:space:]]' || true; }
+
+# Selection syntax: 3 | 1,4,9 | 2-10 | all | combinations, with !N or !N-M to
+# exclude. Exclusions are applied last, so "all,!7" means everything but 7.
+expand_selection() { # spec max -> indices on stdout, one per line
+  printf '%s' "$1" | tr ',' '\n' | awk -v max="$2" '
+    { gsub(/^[ \t]+|[ \t]+$/, "") }
+    /^$/ { next }
+    tolower($0) == "all" { for (i = 1; i <= max; i++) inc[i] = 1; next }
+    /^![0-9]+-[0-9]+$/ { s = substr($0,2); split(s, p, "-")
+                         if (p[1] + 0 > p[2] + 0) { bad = $0; exit }
+                         for (i = p[1]; i <= p[2]; i++) exc[i] = 1; next }
+    /^![0-9]+$/        { exc[substr($0,2) + 0] = 1; next }
+    /^[0-9]+-[0-9]+$/  { split($0, p, "-")
+                         # A reversed range selects nothing, and silently
+                         # selecting nothing is worse than an error: it reads
+                         # as "done" when nothing happened.
+                         if (p[1] + 0 < 1 || p[2] + 0 > max || p[1] + 0 > p[2] + 0) { bad = $0; exit }
+                         for (i = p[1]; i <= p[2]; i++) inc[i] = 1; next }
+    /^[0-9]+$/         { n = $0 + 0
+                         if (n < 1 || n > max) { bad = $0; exit }
+                         inc[n] = 1; next }
+    { bad = $0; exit }
+    END { if (bad != "") { printf "BAD\t%s\n", bad; exit 2 }
+          for (i = 1; i <= max; i++) if (inc[i] && !exc[i]) print i }'
+}
+
+cmd_findings_show() {
+  local idx="${1:-}"
+  [ -n "$idx" ] || die "Usage: $PROG findings show N   (N is the number from findings list)"
+  [ -f "$PICK_FILE" ] || die "No list yet. Run first: $PROG findings list"
+  local row
+  row="$(pick_rows | awk -F'\t' -v i="$idx" '$1 == i')"
+  [ -n "$row" ] || die "Number #$idx is not in the last list ($(pick_count) rows)."
+
+  local n id sev st ti rs
+  IFS=$'\x1f' read -r n id sev st ti rs <<< "${row//$'\t'/$'\x1f'}"
+  hdr "Finding #$n"
+  info "  Name      : ${ti:--}"
+  info "  Severity  : ${sev:--}"
+  info "  Status    : ${st:--}"
+  info "  Resource  : ${rs:--}"
+  info ""
+  info "  ID (full, for copy):"
+  info "    $id"
+  info ""
+  dim "  But you do not need to copy it. Recast by its number:"
+  dim "    $PROG recast pick --select $n --to high --reason '...'"
+}
+
+# Re-runs the cached query and keeps only the selected ids that are still live.
+# Sets PICK_IDS (file path) and PICK_STALE (count).
+PICK_IDS=""; PICK_STALE=0
+pick_resolve() { # selection_spec
+  local spec="$1" max q live sel
+  max="$(pick_count)"
+  [ "${max:-0}" -gt 0 ] || die "Last list is empty. Run: $PROG findings list"
+
+  sel="$(mktemp)"
+  if ! expand_selection "$spec" "$max" > "$sel" 2>/dev/null; then
+    local bad; bad="$(expand_selection "$spec" "$max" 2>&1 | sed -n 's/^BAD\t//p' | head -1)"
+    rm -f "$sel"
+    die "Invalid selection: '${bad:-$spec}'
+  Accepted forms: 3 | 1,4,9 | 2-10 | all | all,!7
+  Available range: 1-$max"
+  fi
+  local nsel; nsel="$(grep -c '[^[:space:]]' < "$sel" || true)"
+  [ "${nsel:-0}" -gt 0 ] || { rm -f "$sel"; die "Selection '$spec' selected nothing."; }
+
+  # Staleness: ids can change between scans, so the cache is never trusted on
+  # its own. The cached query is re-run and the selection intersected with it.
+  local age; age=$(( $(date +%s) - $(pick_fetched) ))
+  q="$(pick_query)"
+  step "Verifikasi ulang $nsel pilihan terhadap data live (cache umur $((age/60))m)..."
+  live="$(mktemp)"
+  findings_fetch "$q" 500 | cut -f1 | sort -u > "$live" || { rm -f "$sel" "$live"; return 1; }
+
+  PICK_IDS="$(mktemp)"
+  : > "$PICK_IDS"
+  local i row id
+  while IFS= read -r i; do
+    [ -n "$i" ] || continue
+    row="$(pick_rows | awk -F'\t' -v k="$i" '$1 == k')"
+    id="$(printf '%s' "$row" | cut -f2)"
+    if grep -qxF "$id" "$live"; then
+      printf '%s\t%s\n' "$i" "$id" >> "$PICK_IDS"
+    else
+      PICK_STALE=$(( PICK_STALE + 1 ))
+      warn "  #$i no longer in the query result - skipped (finding changed/removed)"
+    fi
+  done < "$sel"
+  rm -f "$sel" "$live"
+
+  local kept; kept="$(grep -c '[^[:space:]]' < "$PICK_IDS" || true)"
+  [ "${kept:-0}" -gt 0 ] || die "All selections are stale. Re-run: $PROG findings list"
+  ok "$kept finding valid${PICK_STALE:+, $PICK_STALE dilewati}"
+}
+
+# Prints what is about to change, by NAME, before anything is sent.
+pick_preview() { # target
+  local target="$1" i id row sev ti
+  hdr "About to change → $(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')"
+  while IFS= read -r _l; do
+    IFS=$'\x1f' read -r i id <<< "${_l//$'\t'/$'\x1f'}"
+    [ -n "${i:-}" ] || continue
+    row="$(pick_rows | awk -F'\t' -v k="$i" '$1 == k')"
+    sev="$(printf '%s' "$row" | cut -f3)"
+    ti="$(printf '%s' "$row" | cut -f5)"
+    printf '  #%-4s %-9s → %-9s %s\n' "$i" "$(printf '%s' "${sev:--}" | tr '[:lower:]' '[:upper:]')" \
+      "$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')" "${ti:--}" >&2
+  done < "$PICK_IDS"
+}
+
+cmd_recast_pick() {
+  need_auth; guard_severity_mode
+  local spec="" target="" reason="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --select) spec="$2"; shift 2 ;;
+      --to) target="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$spec" ]   || die "--select required (e.g. 3 | 1,4,9 | 2-10 | all | all,!7)"
+  [ -n "$target" ] || die "--to required"
+  valid_sev "$target" || die "Invalid severity: $target"
+  [ -n "$reason" ] || die "--reason required"
+  target="$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')"
+
+  pick_resolve "$spec" || return 1
+  pick_preview "$target"
+  info ""
+  cut -f2 "$PICK_IDS" | batch_stream severity_batch "$BATCH_SEVERITY" "$target" "$reason" "$apply"
+  local rc=$?; rm -f "$PICK_IDS"; return $rc
+}
+
+cmd_mute_pick() {
+  need_auth
+  local spec="" reason="" unmute=0 apply=0 muted=true allowed
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --select) spec="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;;
+      --unmute) unmute=1; shift ;;
+      --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$spec" ] || die "--select required"
+  [ -n "$reason" ] || die "--reason required"
+  reason="$(printf '%s' "$reason" | tr '[:lower:]' '[:upper:]')"
+  if [ "$unmute" -eq 1 ]; then muted=false; allowed="$UNMUTE_REASONS"
+  else muted=true; allowed="$MUTE_REASONS"; fi
+  printf '%s' "$allowed" | tr ' ' '\n' | grep -qx "$reason" \
+    || die "Reason '$reason' is not valid for this direction.
+  Valid: $allowed"
+
+  pick_resolve "$spec" || return 1
+  pick_preview "muted=$muted"
+  info ""
+  cut -f2 "$PICK_IDS" | batch_stream mute_batch "$BATCH_MUTE" "$muted" "$reason" "$apply"
+  local rc=$?; rm -f "$PICK_IDS"; return $rc
+}
+
+# -----------------------------------------------------------------------------
+# recast (severity override)
+# -----------------------------------------------------------------------------
+# Severity floors differ per finding type. Info/None is rejected for
+# static_code_vulnerability, secret, iac_misconfiguration and
+# runtime_code_vulnerability, whose floor is low.
+valid_sev() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    info|none|info_none|low|medium|high|critical) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+audit_log() { # kind target_id action detail http_code
+  mkdir -p "$AUDIT_DIR"; chmod 700 "$AUDIT_DIR" 2>/dev/null
+  local f="$AUDIT_DIR/dd-sec-$(date +%Y%m%d).csv"
+  if [ ! -f "$f" ]; then
+    printf 'timestamp,site,org,kind,target_id,action,detail,http_code\n' > "$f"
+    chmod 600 "$f"
+  fi
+  printf '%s,%s,"%s",%s,%s,%s,"%s",%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DD_SITE_R:-?}" "${ORG_NAME:-?}" \
+    "$1" "$2" "$3" "$(printf '%s' "$4" | sed 's/"/""/g')" "$5" >> "$f"
+}
+
+guard_severity_mode() {
+  [ -n "$SEV_MODE" ] || SEV_MODE="$(session_field severity_mode)"
+  if [ "$SEV_MODE" = "rule" ]; then
+    die "The per-finding severity endpoint does not accept key auth in this org.
+  Use    : $PROG rule create ...
+  Recheck: $PROG auth probe"
+  fi
+}
+
+# One PATCH per batch. ids arrive on stdin, one per line.
+severity_batch() { # target reason
+  local target="$1" reason="$2" ids body n
+  ids="$(cat)"
+  n="$(printf '%s\n' "$ids" | grep -c '[^[:space:]]' || true)"
+  [ "${n:-0}" -gt 0 ] || return 0
+
+  body="$(printf '%s\n' "$ids" | jq -R 'select(length>0)' | jq -sc \
+    --arg sev "$target" --arg desc "$reason" '
+    { data: { type: "severity_override",
+              attributes: { severity: { action: "set", value: $sev } }
+                + (if $desc == "" then {} else { description: $desc } end),
+              relationships: { findings: { data: map({type:"findings", id:.}) } } } }')"
+
+  local rc=0
+  if dd_req_retry PATCH /api/v2/security/findings/severity "$body"; then
+    ok "batch $n finding → $target (HTTP $HTTP_CODE)"
+  else
+    warn "batch FAILED (HTTP $HTTP_CODE): $(api_error)"; rc=1
+  fi
+  printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -n "$id" ] && audit_log finding "$id" "severity=$target" "$reason" "$HTTP_CODE"
+  done
+  return $rc
+}
+
+mute_batch() { # is_muted reason
+  local muted="$1" reason="$2" ids body n
+  ids="$(cat)"
+  n="$(printf '%s\n' "$ids" | grep -c '[^[:space:]]' || true)"
+  [ "${n:-0}" -gt 0 ] || return 0
+
+  body="$(printf '%s\n' "$ids" | jq -R 'select(length>0)' | jq -sc \
+    --argjson m "$muted" --arg r "$reason" '
+    { data: { type: "finding",
+              attributes: { mute: { is_muted: $m, reason: $r } },
+              relationships: { findings: { data: map({type:"finding", id:.}) } } } }')"
+
+  local rc=0
+  if dd_req_retry PATCH /api/v2/security/findings/mute "$body"; then
+    ok "batch $n finding → muted=$muted (HTTP $HTTP_CODE)"
+  else
+    warn "batch FAILED (HTTP $HTTP_CODE): $(api_error)"; rc=1
+  fi
+  printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -n "$id" ] && audit_log finding "$id" "mute=$muted" "$reason" "$HTTP_CODE"
+  done
+  return $rc
+}
+
+# Batches ids from stdin through a handler. Staged in a temp file so memory
+# stays flat no matter how many findings are involved.
+batch_stream() { # batch_fn size arg1 arg2 apply
+  local fn="$1" size="$2" a1="$3" a2="$4" apply="$5"
+  local count=0 total=0 batches=0 failed=0 id
+  local buf; buf="$(mktemp)"
+
+  _flush() {
+    batches=$(( batches + 1 ))
+    if [ "$apply" -eq 1 ]; then
+      "$fn" "$a1" "$a2" < "$buf" || failed=$(( failed + 1 ))
+    else
+      info "  [dry-run] batch $batches: $count finding"
+    fi
+    : > "$buf"; count=0
+  }
+
+  while IFS= read -r id; do
+    id="$(printf '%s' "$id" | tr -d '[:space:]')"
+    [ -n "$id" ] || continue
+    printf '%s\n' "$id" >> "$buf"
+    count=$(( count + 1 )); total=$(( total + 1 ))
+    [ "$count" -ge "$size" ] && _flush
+  done
+  [ "$count" -gt 0 ] && _flush
+  rm -f "$buf"
+
+  info ""
+  if [ "$apply" -eq 1 ]; then
+    ok "Done: $total findings, $batches batches, $failed failed"
+    dim "  Audit: $AUDIT_DIR/dd-sec-$(date +%Y%m%d).csv"
+  else
+    warn "DRY-RUN: $total findings in $batches batches. Add --apply to execute."
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+cmd_recast_one() {
+  need_auth; guard_severity_mode
+  local id="" target="" reason="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;; --to) target="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;; --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$id" ] || die "--id required"
+  [ -n "$target" ] || die "--to required (info_none|low|medium|high|critical)"
+  valid_sev "$target" || die "Invalid severity: $target"
+  [ -n "$reason" ] || die "--reason required (audit trail)"
+  target="$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')"
+  printf '%s\n' "$id" | batch_stream severity_batch "$BATCH_SEVERITY" "$target" "$reason" "$apply"
+}
+
+cmd_recast_query() {
+  need_auth; guard_severity_mode
+  local query="" target="" reason="" apply=0 max=500
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --query) query="$2"; shift 2 ;; --to) target="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;; --limit) max="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$query" ] || die "--query required"
+  [ -n "$target" ] || die "--to required"
+  valid_sev "$target" || die "Invalid severity: $target"
+  [ -n "$reason" ] || die "--reason required"
+  target="$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')"
+
+  step "Query: $query"
+  local t; t="$(mktemp)"
+  findings_fetch "$query" "$max" | cut -f1 > "$t"
+  local n; n="$(grep -c '[^[:space:]]' < "$t" || true)"
+  [ "${n:-0}" -gt 0 ] || { rm -f "$t"; die "0 finding match query"; }
+  ok "$n finding match"; info ""
+  batch_stream severity_batch "$BATCH_SEVERITY" "$target" "$reason" "$apply" < "$t"
+  local rc=$?; rm -f "$t"; return $rc
+}
+
+# CSV: finding_id,target_severity,reason   (reason may contain commas: the last
+# column is joined from fields 3..NF)
+# JSON: [{"finding_id":"...","target_severity":"high","reason":"..."}]
+cmd_recast_bulk() {
+  need_auth; guard_severity_mode
+  local file="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --file) file="$2"; shift 2 ;; --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$file" ] || die "--file required"
+  [ -f "$file" ] || die "File not found: $file"
+
+  # Three input shapes, because they arrive from different places:
+  #   .json  hand-built or generated by another tool
+  #   .tsv   produced by `findings list --export`, header-mapped, extra columns
+  #          carried for human review and ignored here
+  #   .csv   positional legacy: id, severity, reason (reason joins to end)
+  # Header mapping matters for the export: it carries current_severity and name
+  # so a reviewer can see what they are deciding on, and those columns must not
+  # be mistaken for the decision columns.
+  local norm; norm="$(mktemp)"
+  case "$file" in
+    *.json)
+      jq -r '.[] | [.finding_id, (.target_severity//.severity//""), (.reason//"")] | @tsv' \
+        "$file" > "$norm" 2>/dev/null || { rm -f "$norm"; die "Invalid JSON / wrong schema"; } ;;
+    *.tsv)
+      awk -F'\t' 'BEGIN{OFS="\t"; ci=0; ct=0; cr=0}
+        NR==1 {
+          for (i = 1; i <= NF; i++) {
+            h = tolower($i); gsub(/^[ \t]+|[ \t]+$/, "", h)
+            if (h ~ /^finding_?id$/)      ci = i
+            else if (h == "target_severity") ct = i
+            else if (h == "reason")          cr = i
+          }
+          if (ci == 0 || ct == 0) {
+            print "HEADER_MISSING" > "/dev/stderr"; exit 3
+          }
+          next
+        }
+        {
+          id = $ci; tg = tolower($ct); rs = (cr ? $cr : "")
+          gsub(/^[ \t]+|[ \t]+$/, "", id); gsub(/[ \t]+/, "", tg)
+          gsub(/^[ \t]+|[ \t]+$/, "", rs)
+          if (id == "") next
+          print id, tg, rs
+        }' "$file" > "$norm" 2>/tmp/ddsec_hdr.$$ \
+        || { rm -f "$norm"
+             if grep -q HEADER_MISSING /tmp/ddsec_hdr.$$ 2>/dev/null; then
+               rm -f /tmp/ddsec_hdr.$$
+               die "The TSV header must have 'finding_id' and 'target_severity' columns.
+  A file from '$PROG findings list --export' already carries them."
+             fi
+             rm -f /tmp/ddsec_hdr.$$; die "Failed to read $file"; }
+      rm -f /tmp/ddsec_hdr.$$ ;;
+    *)
+      awk -F',' 'NR==1 && tolower($1) ~ /finding_?id/ { next }
+                 NF>=2 { gsub(/^[ \t"]+|[ \t"]+$/,"",$1); gsub(/^[ \t"]+|[ \t"]+$/,"",$2)
+                         r=""; for(i=3;i<=NF;i++){ r = r (i>3 ? "," : "") $i }
+                         gsub(/^[ \t"]+|[ \t"]+$/,"",r)
+                         printf "%s\t%s\t%s\n", $1, tolower($2), r }' "$file" > "$norm" ;;
+  esac
+
+  # An empty target_severity means "leave this one alone". That is what makes
+  # the export round trip usable: fill in the rows you decided on, leave the
+  # rest, no deleting required. An INVALID non-empty value still aborts.
+  local skipped; skipped="$(awk -F'\t' '$2 == "" { c++ } END { print c+0 }' "$norm")"
+  if [ "$skipped" -gt 0 ]; then
+    awk -F'\t' '$2 != ""' "$norm" > "${norm}.keep" && mv "${norm}.keep" "$norm"
+    dim "  $skipped rows skipped (empty target_severity = left unchanged)."
+  fi
+
+  local rows; rows="$(grep -c '[^[:space:]]' < "$norm" || true)"
+  [ "${rows:-0}" -gt 0 ] || { rm -f "$norm"
+    die "No rows with a filled target_severity in $file.
+  Fill the target_severity column for the rows you want to change."; }
+  step "$rows rows to change, from $file"
+
+  # Validate everything BEFORE the first request. A half-applied bulk recast is
+  # worse than a rejected one, so this fails closed on any bad row.
+  local bad=0 lineno=0 fid sev rsn
+  while IFS= read -r _row; do
+    IFS=$'\x1f' read -r fid sev rsn <<< "${_row//$'\t'/$'\x1f'}"
+    lineno=$(( lineno + 1 ))
+    [ -n "${fid:-}" ]  || { warn "row $lineno: finding_id empty"; bad=1; }
+    valid_sev "${sev:-}" || { warn "row $lineno: invalid severity '${sev:-}'"; bad=1; }
+    [ -n "${rsn:-}" ]  || { warn "row $lineno: reason empty"; bad=1; }
+  done < "$norm"
+  [ "$bad" -eq 0 ] || { rm -f "$norm"; die "Invalid rows present, aborted (fail closed)."; }
+
+  # Rows sharing a severity and reason go in one payload, so the number of
+  # requests tracks distinct decisions rather than row count.
+  local groups; groups="$(cut -f2,3 < "$norm" | sort -u)"
+  local g_sev g_rsn sub rc=0
+  info ""
+  while IFS= read -r _g; do
+    IFS=$'\x1f' read -r g_sev g_rsn <<< "${_g//$'\t'/$'\x1f'}"
+    [ -n "${g_sev:-}" ] || continue
+    sub="$(mktemp)"
+    awk -F'\t' -v s="$g_sev" -v r="${g_rsn:-}" '$2==s && $3==r { print $1 }' "$norm" > "$sub"
+    step "Group → $g_sev  ($(grep -c '[^[:space:]]' < "$sub") finding)  reason=\"${g_rsn:-}\""
+    batch_stream severity_batch "$BATCH_SEVERITY" "$g_sev" "${g_rsn:-}" "$apply" < "$sub" || rc=1
+    rm -f "$sub"
+  done <<EOF
+$groups
+EOF
+  rm -f "$norm"
+  return $rc
+}
+
+# -----------------------------------------------------------------------------
+# mute / unmute
+# Reasons are enumerated by the API and differ by direction:
+#   mute   PENDING_FIX FALSE_POSITIVE OTHER NO_FIX DUPLICATE RISK_ACCEPTED
+#   unmute NO_PENDING_FIX HUMAN_ERROR NO_LONGER_ACCEPTED_RISK OTHER
+# -----------------------------------------------------------------------------
+MUTE_REASONS="PENDING_FIX FALSE_POSITIVE OTHER NO_FIX DUPLICATE RISK_ACCEPTED"
+UNMUTE_REASONS="NO_PENDING_FIX HUMAN_ERROR NO_LONGER_ACCEPTED_RISK OTHER"
+
+cmd_mute() {
+  need_auth
+  local id="" query="" reason="" unmute=0 apply=0 max=500 muted=true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;; --query) query="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;; --unmute) unmute=1; shift ;;
+      --limit) max="$2"; shift 2 ;; --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$id" ] || [ -n "$query" ] || die "--id or --query required"
+  [ -n "$reason" ] || die "--reason required"
+  reason="$(printf '%s' "$reason" | tr '[:lower:]' '[:upper:]')"
+
+  local allowed
+  if [ "$unmute" -eq 1 ]; then muted=false; allowed="$UNMUTE_REASONS"
+  else muted=true; allowed="$MUTE_REASONS"; fi
+  printf '%s' "$allowed" | tr ' ' '\n' | grep -qx "$reason" \
+    || die "Reason '$reason' is not valid for this direction.
+  Valid: $allowed"
+
+  local t; t="$(mktemp)"
+  if [ -n "$id" ]; then
+    printf '%s\n' "$id" > "$t"
+  else
+    step "Query: $query"
+    findings_fetch "$query" "$max" | cut -f1 > "$t"
+    local n; n="$(grep -c '[^[:space:]]' < "$t" || true)"
+    [ "${n:-0}" -gt 0 ] || { rm -f "$t"; die "0 finding match query"; }
+    ok "$n finding match"
+  fi
+  info ""
+  batch_stream mute_batch "$BATCH_MUTE" "$muted" "$reason" "$apply" < "$t"
+  local rc=$?; rm -f "$t"; return $rc
+}
+
+# -----------------------------------------------------------------------------
+# severity modifier rules (documented, always key-auth)
+# -----------------------------------------------------------------------------
+cmd_rule_list() {
+  need_auth
+  dd_req_retry GET /api/v2/security/findings/automation/severity_modifier_rules \
+    || { explain_http; return 1; }
+  local n; n="$(printf '%s' "$HTTP_BODY" | jq -r '.data|length')"
+  hdr "$n severity modifier rule (order = priority, first-match)"
+  printf '%s' "$HTTP_BODY" | jq -r '
+    .data[]? | [ .id, (.attributes.name // ""), (.attributes.action.type // ""),
+                 (.attributes.action.value // .attributes.action.direction // ""),
+                 ((.attributes.scope.finding_types // []) | join(",")) ] | @tsv' \
+    | awk -F'\t' '{ printf "  %-38s %-30.30s %-6s %-9s %s\n", $1, $2, $3, $4, $5 }' >&2
+  info ""
+  dim "  Rules evaluate against @severity_details.adjusted.value, not @severity."
+  dim "  The first matching rule is used; the rest are not evaluated."
+}
+
+cmd_rule_create() {
+  need_auth
+  local name="" target="" types="" query="" desc="" action="set" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --to) target="$2"; action="set"; shift 2 ;;
+      --shift) target="$2"; action="shift"; shift 2 ;;
+      --types) types="$2"; shift 2 ;; --query) query="$2"; shift 2 ;;
+      --reason) desc="$2"; shift 2 ;; --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$name" ] || die "--name required"
+  [ -n "$target" ] || die "--to <sev> or --shift up|down required"
+  [ -n "$types" ] || die "--types required (e.g. static_code_vulnerability)"
+  [ -n "$desc" ] || die "--reason required"
+
+  # @severity and @severity_details.user_adjusted are rejected in a rule query.
+  case "$query" in
+    *@severity:*|*@severity_details.user_adjusted*)
+      die "A rule query may not use @severity or @severity_details.user_adjusted.
+  Rules evaluate against @severity_details.adjusted.value." ;;
+  esac
+
+  local attrs
+  if [ "$action" = "set" ]; then
+    valid_sev "$target" || die "Invalid severity: $target"
+    attrs="$(jq -nc --arg v "$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')" '{type:"set", value:$v}')"
+  else
+    case "$target" in up|down) : ;; *) die "--shift must be up or down" ;; esac
+    attrs="$(jq -nc --arg d "$target" '{type:"shift", direction:$d}')"
+  fi
+
+  local body
+  body="$(jq -nc --arg name "$name" --arg q "$query" --arg desc "$desc" \
+    --argjson action "$attrs" \
+    --argjson types "$(printf '%s' "$types" | tr ',' '\n' | jq -R 'select(length>0)' | jq -sc .)" '
+    { data: { type: "severity_modifier_rules",
+              attributes: { name: $name, description: $desc, action: $action,
+                            scope: ({ finding_types: $types }
+                                    + (if $q == "" then {} else { query: $q } end)) } } }')"
+
+  if [ "$apply" -eq 0 ]; then
+    warn "DRY-RUN - payload that would be sent:"
+    printf '%s\n' "$body" | jq . >&2
+    dim "  Add --apply to create the rule."
+    return 0
+  fi
+
+  dd_req_retry POST /api/v2/security/findings/automation/severity_modifier_rules "$body" \
+    || { explain_http; return 1; }
+  local rid; rid="$(printf '%s' "$HTTP_BODY" | jq -r '.data.id // ""')"
+  ok "Rule created: $rid"
+  audit_log rule "$rid" "create:${action}=${target}" "$desc" "$HTTP_CODE"
+  dim "  Applies to new findings immediately; existing findings are checked within ~1h."
+}
+
+cmd_rule_delete() {
+  need_auth
+  local rid="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) rid="$2"; shift 2 ;; --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$rid" ] || die "--id required"
+  [ "$apply" -eq 1 ] || { warn "DRY-RUN: would DELETE rule $rid. Add --apply."; return 0; }
+  dd_req_retry DELETE "/api/v2/security/findings/automation/severity_modifier_rules/$rid" \
+    || { explain_http; return 1; }
+  ok "Rule $rid deleted"
+  audit_log rule "$rid" delete "" "$HTTP_CODE"
+}
+
+# -----------------------------------------------------------------------------
+# Work Management (Case Management API v2)
+#
+# Two things about this API are worth knowing before debugging it:
+#   1. A work type can only be used in a project it has been added to. A
+#      mismatched pair makes POST /api/v2/cases return 400 with no detail.
+#   2. There is NO attachment endpoint. A file cannot be uploaded to a work
+#      item under any circumstances; detail has to live in comments.
+# -----------------------------------------------------------------------------
+# Paginated fetch of /api/v2/cases/projects into a JSON array on stdout.
+#
+# The previous version issued ONE request and printed whatever came back, which
+# is why only 2 of 4 projects appeared. Two separate things can shorten that
+# list, and they need different fixes, so both are handled here:
+#
+#   PAGING      the endpoint returns a page, not the whole set. Looped below.
+#   ACCESS      a restricted project the caller cannot read is omitted by the
+#               API even though the UI still lists its name. That is not a bug
+#               to work around, it is an answer - see `work doctor`.
+#
+# The paging params for this endpoint are not documented. If the server ignores
+# them, an offset loop would re-fetch page 1 forever, so identical ids across
+# iterations stop the loop instead of spinning.
+cases_projects_fetch() {
+  local size=100 offset=0 acc="[]" page=0 got seen_before seen_now
+  local all; all="$(mktemp)"
+  printf '[]' > "$all"
+
+  while :; do
+    page=$(( page + 1 ))
+    if ! dd_req_retry GET "/api/v2/cases/projects?page%5Bsize%5D=${size}&page%5Boffset%5D=${offset}"; then
+      # Fall back to the bare endpoint: a rejected paging param must not turn
+      # into "no projects at all".
+      if [ "$page" -eq 1 ]; then
+        dd_req_retry GET /api/v2/cases/projects || { explain_http; rm -f "$all"; return 1; }
+      else
+        break
+      fi
+    fi
+
+    got="$(printf '%s' "$HTTP_BODY" | jq -r '(.data // []) | length')"
+    [ "${got:-0}" -gt 0 ] || break
+
+    seen_before="$(jq -r 'length' "$all")"
+    acc="$(jq -s '.[0] + .[1] | unique_by(.id)' "$all" <(printf '%s' "$HTTP_BODY" | jq '.data // []'))"
+    printf '%s' "$acc" > "$all"
+    seen_now="$(jq -r 'length' "$all")"
+
+    # Nothing new: either the last page, or the endpoint ignores page[offset].
+    [ "$seen_now" -gt "$seen_before" ] || break
+    [ "$got" -ge "$size" ] || break
+    offset=$(( offset + size ))
+    [ "$page" -lt 50 ] || { warn "Berhenti setelah 50 halaman project (pengaman)."; break; }
+  done
+
+  cat "$all"; rm -f "$all"
+}
+
+cmd_work_projects() {
+  need_auth
+  local json; json="$(cases_projects_fetch)" || return 1
+  local n; n="$(printf '%s' "$json" | jq -r 'length')"
+
+  hdr "$n Work Management projects (readable by this app key)"
+  printf '%s' "$json" | jq -r '
+    sort_by(.attributes.name // "") | .[] |
+    [ .id, (.attributes.key // "?"), (.attributes.name // "?"),
+      ((.attributes.restricted // false) | tostring) ] | @tsv' \
+    | awk -F'\t' '{ printf "  %-38s %-12s %-34.34s restricted=%s\n", $1, $2, $3, $4 }' >&2
+  info ""
+  dim "  A restricted=false project is readable org-wide. Findings written"
+  dim "  into it are visible org-wide."
+  dim ""
+  dim "  Fewer here than in the dashboard? That is not a display problem."
+  dim "  The API omits projects this app key identity cannot read,"
+  dim "  while the UI still shows their names. Check the cause:"
+  dim "    $PROG work doctor --expect 'missing-project-name'"
+}
+
+# Answers one question: why does the API return fewer projects than the UI?
+#
+# It checks the three things that can cause it, in the order they are worth
+# ruling out, and prints the restriction policy bindings side by side with the
+# caller's own identity - which is the comparison that actually settles it.
+cmd_work_doctor() {
+  need_auth
+  local expect=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expect) expect="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+
+  hdr "1. Identity behind the app key"
+  local me="" me_name="" me_email=""
+  if dd_req GET /api/v2/current_user; then
+    me="$(printf '%s' "$HTTP_BODY" | jq -r '.data.id // ""')"
+    me_name="$(printf '%s' "$HTTP_BODY" | jq -r '.data.attributes.name // ""')"
+    me_email="$(printf '%s' "$HTTP_BODY" | jq -r '.data.attributes.email // ""')"
+    info "  user:${me}"
+    info "  ${me_name:-?}  <${me_email:-?}>"
+    dim "  All access below is evaluated against THIS identity, not"
+    dim "  against your browser session. If both are the same user, the result"
+    dim "  should match too - unless the app key is scoped (see section 2)."
+  else
+    warn "GET /api/v2/current_user failed (HTTP $HTTP_CODE) - identity cannot be confirmed."
+  fi
+
+  # A SCOPED app key is the one cause that makes the same user see less through
+  # the API than in the browser. Matched by last4 so the key in use is named,
+  # not guessed.
+  hdr "2. Scope app key"
+  local l4="${DD_APP_KEY_R: -4}"
+  if dd_req GET /api/v2/current_user/application_keys; then
+    local row
+    row="$(printf '%s' "$HTTP_BODY" | jq -r --arg l4 "$l4" '
+      [ .data[]? | select((.attributes.last4 // "") == $l4) ][0] // empty')"
+    if [ -n "$row" ]; then
+      info "  name   : $(printf '%s' "$row" | jq -r '.attributes.name // "?"')"
+
+      # The previous version warned whenever `scopes` was non-empty. That was
+      # wrong and actively misleading: a key can carry hundreds of scopes AND
+      # still include cases_read. What matters is whether the specific scopes
+      # this tool needs are present, so each one is checked BY NAME and the
+      # verdict comes from that check - never from the mere presence of a list.
+      local nscope missing="" sc
+      nscope="$(printf '%s' "$row" | jq -r '(.attributes.scopes // []) | length')"
+      if [ "${nscope:-0}" -eq 0 ]; then
+        info "  scopes : <not scoped: inherits all the user's permissions>"
+        dim "  Not the cause. Continue to section 4."
+      else
+        info "  scopes : $nscope scopes listed; the ones relevant to this tool:"
+        for sc in cases_read cases_write security_monitoring_findings_read \
+                  security_monitoring_findings_write security_pipelines_read \
+                  code_analysis_read; do
+          if printf '%s' "$row" | jq -e --arg s "$sc" \
+               '((.attributes.scopes // []) | index($s)) != null' >/dev/null 2>&1; then
+            printf '    %s✓%s %s\n' "$C_GRN" "$C_OFF" "$sc" >&2
+          else
+            printf '    %s✗%s %s\n' "$C_RED" "$C_OFF" "$sc" >&2
+            missing="${missing:+$missing }$sc"
+          fi
+        done
+        if [ -z "$missing" ]; then
+          ok "  All required scopes are PRESENT - scope is NOT the cause."
+          dim "  Continue to section 4: the cause is a restriction policy, not the key."
+        else
+          warn "  Missing scopes:$missing"
+          dim "  If cases_read is among the missing, that is the cause. If"
+          dim "  cases_read is PRESENT but the project is still missing, continue to section 4."
+        fi
+      fi
+    else
+      dim "  A key with last4='$l4' is not in this user's app key list."
+      dim "  That means the app key belongs to ANOTHER user (e.g. a service account),"
+      dim "  so the access evaluated is that user's, not yours."
+    fi
+  else
+    dim "  Cannot read the app key list (HTTP $HTTP_CODE). Skipping."
+  fi
+
+  hdr "3. Projects readable via the API"
+  local json n
+  json="$(cases_projects_fetch)" || return 1
+  n="$(printf '%s' "$json" | jq -r 'length')"
+  info "  $n project"
+  printf '%s' "$json" | jq -r '
+    sort_by(.attributes.name // "") | .[] |
+    "  \(.attributes.key // "?")\u0009\(.attributes.name // "?")\u0009restricted=\((.attributes.restricted // false)|tostring)"' \
+    | awk -F'\t' '{ printf "  %-12s %-34.34s %s\n", $1, $2, $3 }' >&2
+
+  hdr "4. Restriction policy per project"
+  dim "  This policy decides who can read. A principal NOT"
+  dim "  listed at all has no access - including the rest of the org."
+  local pid pkey
+  printf '%s' "$json" | jq -r '.[] | "\(.id)\u0009\(.attributes.key // "?")"' \
+  | while IFS= read -r _row; do
+      IFS=$'\x1f' read -r pid pkey <<< "${_row//$'\t'/$'\x1f'}"
+      [ -n "${pid:-}" ] || continue
+      if dd_req GET "/api/v2/restriction_policy/case-management-project:${pid}"; then
+        local b
+        b="$(printf '%s' "$HTTP_BODY" | jq -r '
+          (.data.attributes.bindings // [])
+          | if length == 0 then "    <no policy: open to the whole org>"
+            else map("    \(.relation): \((.principals // []) | join(", "))") | join("\n") end')"
+        info "  ${pkey} (${pid})"
+        info "$b"
+      else
+        info "  ${pkey} (${pid})"
+        case "$HTTP_CODE" in
+          404) dim "    <no restriction policy: open to the whole org>" ;;
+          403) dim "    policy EXISTS but this identity may not read it" ;;
+          *)   dim "    cannot be read (HTTP $HTTP_CODE)" ;;
+        esac
+      fi
+    done
+
+  if [ -n "$expect" ]; then
+    hdr "5. Projects you expect to exist"
+    local want missing=0
+    printf '%s' "$expect" | tr ',' '\n' | while IFS= read -r want; do
+      want="$(printf '%s' "$want" | sed 's/^[ \t]*//; s/[ \t]*$//')"
+      [ -n "$want" ] || continue
+      if printf '%s' "$json" | jq -e --arg w "$want" '
+           any(.[]; ((.attributes.name // "") | ascii_downcase) == ($w | ascii_downcase)
+                    or ((.attributes.key // "") | ascii_downcase) == ($w | ascii_downcase))' >/dev/null 2>&1; then
+        ok "  '$want' READABLE via the API"
+      else
+        warn "  '$want' NOT readable via the API"
+        dim "    If this project appears in the dashboard, then the identity in"
+        dim "    section 1 is not included in its restriction policy. The UI still"
+        dim "    shows the name; the API omits it - and the API is correct."
+        dim "    Open in the UI: Work Management → that project → Settings → Access,"
+        dim "    then add the user/team from section 1 as at least Viewer."
+      fi
+    done
+  fi
+
+  info ""
+  hdr "How to read this"
+  dim "  Read section 2 first:"
+  dim "    cases_read KURANG → that is the cause, done."
+  dim "    cases_read ADA    → scope is not the cause; the cause is a restriction"
+  dim "                        policy on the missing project."
+  dim ""
+  dim "  The missing project's policy CANNOT be read from here: a project that"
+  dim "  is unreadable also does not appear in section 3, so its id is unknown."
+  dim "  Take its id from the project URL in the UI, then:"
+  dim "    $PROG work project-access --id <uuid-from-url>"
+  dim ""
+  dim "  Projects auto-created by the SAST gate hit this most often:"
+  dim "  the gate locks the project it created and only binds its own team"
+  dim "  plus identitasnya sendiri."
+}
+
+# Reads the restriction policy of ANY project id, including one that does not
+# appear in `work projects`.
+#
+# This is the piece `work doctor` cannot do on its own: a project the identity
+# cannot read is absent from the listing, so its id is unknown. The id is
+# visible in the project URL in the UI, and a restriction policy can be read by
+# id even when the project itself cannot be listed - which is exactly what
+# settles whether the cause is access rather than paging.
+cmd_work_project_access() {
+  need_auth
+  local pid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --id) pid="$2"; shift 2 ;; *) die "Unknown argument: $1" ;; esac
+  done
+  [ -n "$pid" ] || die "--id required.
+  Take the UUID from the project URL in the UI, e.g.
+  $(app_base "${DD_SITE_R:-datadoghq.com}")/cases/projects/<UUID>"
+
+  local me; me="$(self_principal || true)"
+  hdr "Akses project $pid"
+  [ -z "$me" ] || info "  app key identity  : user:${me}"
+
+  printf '  readable in list : ' >&2
+  local json
+  json="$(cases_projects_fetch 2>/dev/null)" || json='[]'
+  if printf '%s' "$json" | jq -e --arg p "$pid" 'any(.[]; .id == $p)' >/dev/null 2>&1; then
+    printf '%sya%s (%s)\n' "$C_GRN" "$C_OFF" \
+      "$(printf '%s' "$json" | jq -r --arg p "$pid" '[.[]|select(.id==$p)|.attributes.name][0] // "?"')" >&2
+  else
+    printf '%stidak%s\n' "$C_RED" "$C_OFF" >&2
+  fi
+
+  info ""
+  info "  Restriction policy:"
+  if dd_req GET "/api/v2/restriction_policy/case-management-project:${pid}"; then
+    local b
+    b="$(printf '%s' "$HTTP_BODY" | jq -r '
+      (.data.attributes.bindings // [])
+      | if length == 0 then "    <empty policy: open to the whole org>"
+        else map("    \(.relation): \((.principals // []) | join(", "))") | join("\n") end')"
+    info "$b"
+    info ""
+    if [ -n "$me" ]; then
+      if printf '%s' "$HTTP_BODY" | jq -e --arg me "user:${me}" \
+           '[(.data.attributes.bindings // [])[].principals[]?] | index($me) != null' >/dev/null 2>&1; then
+        ok "  The app key identity is bound DIRECTLY in this policy."
+        dim "  If the project still is not readable, report it - that is abnormal."
+      else
+        warn "  The app key identity is NOT bound directly in this policy."
+        dim "  Access may still come via a team: or role: binding above -"
+        dim "  that follows membership, and membership cannot be checked"
+        dim "  from this endpoint. If this project is not readable in the list,"
+        dim "  it means you are indeed not a member."
+        dim ""
+        dim "  Fix: UI → project → Settings → Access, add"
+        dim "  user:${me} as at least Viewer; or add that identity"
+        dim "  to one of the teams already bound above."
+      fi
+    fi
+  else
+    case "$HTTP_CODE" in
+      404) dim "    <no policy>"
+           info ""
+           dim "  Without a policy, the project is open to the whole org. So if"
+           dim "  this project still is not readable in the list, the cause is NOT"
+           dim "  restriction policy - and not scope (section 2, doctor)."
+           dim "  Remaining possibilities: the id is wrong, or the project is in another org."
+           dim "  Check DD_SITE now: ${DD_SITE_R}" ;;
+      403) dim "    may not be read by this identity (HTTP 403)"
+           info ""
+           dim "  a 403 here is itself the answer: the policy exists and"
+           dim "  this identity is not part of it." ;;
+      *)   dim "    failed to read (HTTP $HTTP_CODE): $(api_error)" ;;
+    esac
+  fi
+}
+
+cmd_work_types() {
+  need_auth
+  dd_req_retry GET /api/v2/cases/types || { explain_http; return 1; }
+  hdr "Work types"
+  printf '%s' "$HTTP_BODY" | jq -r '
+    .data[]? | [ .id, (.attributes.name // "?") ] | @tsv' \
+    | awk -F'\t' '{ printf "  %-38s %s\n", $1, $2 }' >&2
+}
+
+cmd_work_use_project() {
+  need_auth
+  local pid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --id) pid="$2"; shift 2 ;; *) die "Unknown argument: $1" ;; esac
+  done
+  [ -n "$pid" ] || die "--id required (see: $PROG work projects)"
+
+  # Verified against the real list rather than trusted: a project id is
+  # org-scoped, and an id from another org fails much later with a message that
+  # points at the work type instead of the project.
+  dd_req_retry GET /api/v2/cases/projects || { explain_http; return 1; }
+  local hit
+  hit="$(printf '%s' "$HTTP_BODY" | jq -r --arg p "$pid" '[.data[]?|select(.id==$p)|.attributes.name][0] // empty')"
+  [ -n "$hit" ] || die "Project $pid does not exist in this org.
+  That project id is org-scoped. Check DD_SITE and: $PROG work projects"
+  session_set project_id "$pid"
+  PROJECT_ID="$pid"
+  ok "Active project: $hit ($pid)"
+}
+
+cmd_work_list() {
+  need_auth
+  local filter="" size=50
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --filter) filter="$2"; shift 2 ;; --limit) size="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  local qs="page%5Bsize%5D=$size"
+  [ -z "$filter" ] || qs="filter=$(urlencode "$filter")&$qs"
+
+  dd_req_retry GET "/api/v2/cases?$qs" || { explain_http; return 1; }
+  local n; n="$(printf '%s' "$HTTP_BODY" | jq -r '(.data // [])|length')"
+  hdr "$n work item${filter:+  (filter: $filter)}"
+
+  # The /api/v2/cases search is free-text and NOT project-scoped, so results can
+  # include items from other projects. When a project is selected, non-matching
+  # rows are marked rather than hidden, so nothing silently disappears.
+  printf '%s' "$HTTP_BODY" | jq -r --arg p "${PROJECT_ID:-}" '
+    .data[]? |
+    [ (.attributes.key // "?"),
+      (.attributes.status_name // "?"),
+      (.attributes.priority // "?"),
+      ((.relationships.project.data.id // .attributes.project_id // "") | tostring),
+      (.attributes.title // "?"),
+      .id ] | @tsv' \
+    | awk -F'\t' -v p="${PROJECT_ID:-}" '
+        { mark = (p != "" && $4 != "" && $4 != p) ? "*" : " "
+          printf "%s %-12s %-22.22s %-4s %-46.46s\n", mark, $1, $2, $3, $5 }' >&2
+  info ""
+  [ -z "$PROJECT_ID" ] || dim "  * = work items outside the active project ($PROJECT_ID)"
+  dim "  Detail: $PROG work view --key <KEY>"
+}
+
+cmd_work_view() {
+  need_auth
+  local key=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --key) key="$2"; shift 2 ;; *) die "Unknown argument: $1" ;; esac
+  done
+  [ -n "$key" ] || die "--key required (e.g. SAST-123)"
+
+  # Looked up through the search filter rather than a GET by id, because the key
+  # is what a human has and the id is not exposed in the UI.
+  dd_req_retry GET "/api/v2/cases?filter=$(urlencode "$key")&page%5Bsize%5D=50" \
+    || { explain_http; return 1; }
+  local item
+  item="$(printf '%s' "$HTTP_BODY" | jq -c --arg k "$key" \
+    '[.data[]? | select((.attributes.key // "") == $k)][0] // empty')"
+  [ -n "$item" ] || die "Work item '$key' not found."
+
+  local cid; cid="$(printf '%s' "$item" | jq -r '.id')"
+  hdr "$key"
+  printf '%s' "$item" | jq -r '
+    "  Title      : " + (.attributes.title // "?") + "\n" +
+    "  Status     : " + (.attributes.status_name // "?") + "\n" +
+    "  Priority   : " + (.attributes.priority // "?") + "\n" +
+    "  Created    : " + (.attributes.created_at // "?") + "\n" +
+    "  Modified   : " + (.attributes.modified_at // "never modified") + "\n" +
+    "  Project    : " + ((.relationships.project.data.id // .attributes.project_id // "?") | tostring) + "\n" +
+    "  ID         : " + .id' >&2
+  local attrs
+  attrs="$(printf '%s' "$item" | jq -r '(.attributes.attributes // {}) | to_entries | map("  \(.key) = \(.value|join(","))") | join("\n")')"
+  [ -z "$attrs" ] || { info ""; info "  Custom attributes:"; info "$attrs"; }
+  info ""
+  info "  URL: $(app_base "$DD_SITE_R")/cases/$cid"
+  info ""
+  printf '%s' "$item" | jq -r '(.attributes.description // "") | .[0:1500]' >&2
+  info ""
+  dim "  The Case Management API v2 has no read-comment endpoint, so comments"
+  dim "  can only be viewed in the UI. To write a comment: work comment."
+}
+
+cmd_work_comment() {
+  need_auth
+  local key="" text="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --key) key="$2"; shift 2 ;; --text) text="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$key" ] || die "--key required"
+  [ -n "$text" ] || die "--text required"
+
+  dd_req_retry GET "/api/v2/cases?filter=$(urlencode "$key")&page%5Bsize%5D=50" \
+    || { explain_http; return 1; }
+  local cid
+  cid="$(printf '%s' "$HTTP_BODY" | jq -r --arg k "$key" \
+    '[.data[]? | select((.attributes.key // "") == $k) | .id][0] // empty')"
+  [ -n "$cid" ] || die "Work item '$key' not found."
+
+  [ "$apply" -eq 1 ] || { warn "DRY-RUN: would post a comment to $key ($cid). Add --apply."; return 0; }
+  dd_req_retry POST "/api/v2/cases/$cid/comment" \
+    "$(jq -nc --arg c "$text" '{data:{attributes:{comment:$c},type:"case"}}')" \
+    || { explain_http; return 1; }
+  ok "Comment posted to $key"
+  audit_log case "$key" comment "$text" "$HTTP_CODE"
+}
+
+cmd_work_status() {
+  need_auth
+  local key="" status="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --key) key="$2"; shift 2 ;; --to) status="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$key" ] || die "--key required"
+  [ -n "$status" ] || die "--to required (status name, must match exactly including spaces)"
+
+  dd_req_retry GET "/api/v2/cases?filter=$(urlencode "$key")&page%5Bsize%5D=50" \
+    || { explain_http; return 1; }
+  local cid cur
+  cid="$(printf '%s' "$HTTP_BODY" | jq -r --arg k "$key" '[.data[]?|select((.attributes.key//"")==$k)|.id][0] // empty')"
+  cur="$(printf '%s' "$HTTP_BODY" | jq -r --arg k "$key" '[.data[]?|select((.attributes.key//"")==$k)|.attributes.status_name][0] // ""')"
+  [ -n "$cid" ] || die "Work item '$key' not found."
+
+  info "  $key: ${cur:-?} → $status"
+  [ "$apply" -eq 1 ] || { warn "DRY-RUN. Tambahkan --apply."; return 0; }
+
+  if dd_req_retry POST "/api/v2/cases/$cid/status" \
+       "$(jq -nc --arg s "$status" '{data:{attributes:{status_name:$s},type:"case"}}')"; then
+    ok "Status of $key changed to '$status'"
+    audit_log case "$key" "status=$status" "from:${cur:-?}" "$HTTP_CODE"
+  else
+    explain_http
+    dim "  Two causes cover almost every failure here:"
+    dim "    1. this item's work type has no status named '$status'."
+    dim "       The status name must match exactly, including spaces and case."
+    dim "    2. the project restricts status transitions, and the identity behind the app"
+    dim "       key is not allowed to make this transition."
+    return 1
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# SAST violations (cicodescan track)
+#
+# SCOPE IS OPTIONAL. The query works with no repository filter at all, which is
+# the org-wide view; a repo or a branch only narrows it. Requiring a repo id up
+# front was wrong: most triage starts from "what is broken anywhere", and a
+# branch name alone is a perfectly good filter.
+#
+# REPO NAME VS REPO ID. These are different fields and mixing them returns
+# nothing at all, silently:
+#   @git.repository.name  the bare name, e.g. vulnerable-java-app
+#   @git.repository.id    host plus path, e.g. gitlab.example.com/team/app
+# The value is routed by shape - a "/" means an id, otherwise a name - and the
+# field that was actually used is printed, so a zero result can be told apart
+# from a wrong field.
+# -----------------------------------------------------------------------------
+repo_id_from_git() {
+  local url
+  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  url="${url#git@}"; url="${url#http://}"; url="${url#https://}"
+  url="${url%.git}"; url="${url/://}"
+  printf '%s' "${url%/}"
+}
+
+cmd_sast_list() {
+  need_auth
+  local repo="" repo_id="" sha="" branch="" show_all=0 use_git=0 scope_desc=""
+  local _lb_prev="$SAST_LOOKBACK_DAYS"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)    repo="$2"; shift 2 ;;
+      --repo-id) repo_id="$2"; shift 2 ;;
+      --branch)  branch="$2"; shift 2 ;;
+      --sha)     sha="$2"; shift 2 ;;
+      --days)    SAST_LOOKBACK_DAYS="$2"; shift 2 ;;
+      --from-git) use_git=1; shift ;;
+      --all-categories) show_all=1; shift ;;
+      *) SAST_LOOKBACK_DAYS="$_lb_prev"; die "Unknown argument: $1" ;;
+    esac
+  done
+  case "$SAST_LOOKBACK_DAYS" in
+    ''|*[!0-9]*) SAST_LOOKBACK_DAYS="$_lb_prev"; die "--days must be a number" ;;
+  esac
+
+  if [ "$use_git" -eq 1 ] && [ -z "$repo" ] && [ -z "$repo_id" ]; then
+    repo_id="$(repo_id_from_git)" || die "No git remote in this directory."
+    dim "  repo-id from git remote: $repo_id"
+  fi
+
+  # A bare value handed to --repo that looks like an id is routed to the id
+  # field rather than failing quietly against the name field.
+  if [ -n "$repo" ] && [ -z "$repo_id" ]; then
+    case "$repo" in
+      */*) repo_id="$repo"; repo=""
+           dim "  '$repo_id' contains '/', used as @git.repository.id" ;;
+    esac
+  fi
+
+  # PASTE-SHIFT GUARD. If --branch received something shaped like a repository
+  # identifier (a dotted host followed by a path), the value went into the wrong
+  # field - which is exactly what happens when a pasted value carries a leading
+  # newline and lands in the next prompt. Silently querying
+  # @git.branch:host/path returns zero and looks like "no violations".
+  if [ -n "$branch" ] && printf '%s' "$branch" | grep -Eq '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}/'; then
+    warn "'$branch' looks like host+path, not a branch name."
+    if [ -z "$repo" ] && [ -z "$repo_id" ]; then
+      step "Used as --repo-id, and the branch filter is cleared."
+      dim "  This usually happens when a pasted value carries a leading newline,"
+      dim "  so it lands in the next prompt."
+      repo_id="$branch"; branch=""
+    else
+      dim "  The repo filter is already set, so this value is still used as a branch."
+      dim "  If that is not what you meant, re-run without --branch."
+    fi
+  fi
+
+  local q="@static_analysis.result.item_type:static_analysis_violation -@static_analysis.result.is_suppressed:true -@static_analysis.rule.is_testing:true"
+  [ -z "$repo_id" ] || { q="$q @git.repository.id:${repo_id}"; scope_desc="repo.id=${repo_id}"; }
+  [ -z "$repo" ]    || { q="$q @git.repository.name:${repo}"; scope_desc="repo.name=${repo}"; }
+  [ -z "$branch" ]  || { q="$q @git.branch:${branch}"; scope_desc="${scope_desc:+$scope_desc }branch=${branch}"; }
+  [ -z "$sha" ]     || { q="$q @git.commit.sha:${sha}"; scope_desc="${scope_desc:+$scope_desc }sha=${sha:0:8}"; }
+  [ "$show_all" -eq 1 ] || q="$q @static_analysis.result.category:security"
+
+  step "cicodescan: ${scope_desc:-ALL repos (org-wide)}"
+  [ "$show_all" -eq 0 ] || dim "  Including all categories, not just security."
+
+  local out; out="$(mktemp)"
+  dd_cicodescan "$q" "$out" true || { rm -f "$out"; return 1; }
+
+  local n; n="$(jq -r '.result.events | length' "$out")"
+
+  # @git.repository.name is NOT confirmed to be a facet on the cicodescan
+  # track - the only field the working SAST gate ever used is
+  # @git.repository.id. A filter on a non-facet field returns zero rows with no
+  # error, which looks exactly like "no violations". So a name that finds
+  # nothing is retried as a wildcard against the id, which usually matches
+  # because the id ends with the repository name.
+  if [ "$n" -eq 0 ] && [ -n "$repo" ]; then
+    warn "0 results with @git.repository.name:${repo}"
+    step "Retrying as @git.repository.id:*${repo}* (wildcard)..."
+    local q2="${q// @git.repository.name:${repo}/ @git.repository.id:*${repo}*}"
+    if dd_cicodescan "$q2" "$out" true; then
+      n="$(jq -r '.result.events | length' "$out")"
+      if [ "$n" -gt 0 ]; then
+        ok "Found $n violations via a wildcard on repository.id."
+        dim "  So @git.repository.name really is not a field on this track."
+        dim "  The correct repository.id value:"
+        jq -r '[.result.events[]?.event.custom?.git?.repository?.id?
+                | select(type=="string" and . != "")] | unique | .[]' "$out" 2>/dev/null \
+          | sed 's/^/    /' >&2
+        scope_desc="repo.id=*${repo}* (wildcard)"
+      fi
+    fi
+  fi
+
+  if [ "$n" -eq 0 ]; then
+    warn "0 violations in the last ${SAST_LOOKBACK_DAYS} days."
+    dim "  Zero violations does NOT mean clean code, and guessing which filter"
+    dim "  is wrong among those five ANDed filters is futile. Just measure:"
+    dim ""
+    if [ -n "$repo" ]; then
+      dim "    $PROG sast probe --repo '$repo' --days 90"
+    elif [ -n "$repo_id" ]; then
+      dim "    $PROG sast probe --repo-id '$repo_id' --days 90"
+    else
+      dim "    $PROG sast probe --days 90"
+    fi
+    dim ""
+    dim "  It adds filters one at a time and prints the result count at each"
+    dim "  step. The first line that becomes 0 is the cause."
+    dim "  To see the repo identifiers that actually exist in the data:"
+    dim "    $PROG sast repos"
+    dim ""
+    dim "  Note also the LAST SCAN DATE in the Code Security UI. The"
+    dim "  cicodescan track only stores events for scans inside the time window,"
+    dim "  so a repo last scanned longer ago than ${SAST_LOOKBACK_DAYS} days"
+    dim "  reads as zero even if its findings still show in the UI."
+    dim "    $PROG sast list --days 90 ..."
+    rm -f "$out"; SAST_LOOKBACK_DAYS="$_lb_prev"; return 0
+  fi
+
+  hdr "$n violation"
+  jq -r '
+    .result.events[]?
+    | (.event.custom.static_analysis // {}) as $sa
+    | ($sa.result // {}) as $r | ($sa.rule // {}) as $rule
+    | [ ($r.k9_severity? // ""), ($rule.id? // "?"),
+        ($r.source?.file? // "?"), ($r.source?.start_line? // 0 | tostring),
+        ($r.message? // "" | gsub("[\t\n]"; " ")),
+        (.event.custom?.git?.repository?.name?
+         // .event.custom?.git?.repository?.id? // "") ] | @tsv' "$out" \
+    | awk -F'\t' 'BEGIN{OFS="\t"}
+        { s=tolower($1); rk=7
+          if      (s=="critical") rk=1
+          else if (s=="high")     rk=2
+          else if (s=="medium")   rk=3
+          else if (s=="low")      rk=4
+          else if (s=="info"||s=="notice") rk=5
+          else if (s=="")         rk=6
+          print rk, $0 }' \
+    | sort -t"$(printf '\t')" -k1,1n -s | cut -f2- \
+    | awk -F'\t' '{
+        sev = ($1 == "" ? "-" : toupper($1))
+        printf "  %-9s %-32.32s %s:%s\n", sev, $2, $3, $4
+        if ($6 != "") printf "             %s\n", $6
+        printf "             %.72s\n", $5 }' >&2
+
+  info ""
+  jq -r '[.result.events[]?.event.custom?.static_analysis?.result?.k9_severity? // "unknown"]
+         | group_by(.) | map("\(.[0])=\(length)") | join("  ")' "$out" \
+    | sed 's/^/  Distribution: /' >&2
+  # Only meaningful without a repo filter, where the org-wide spread is the point.
+  if [ -z "$repo" ] && [ -z "$repo_id" ]; then
+    jq -r '[.result.events[]?.event.custom?.git?.repository?.name? // "?"]
+           | group_by(.) | map({r:.[0], n:length}) | sort_by(-.n) | .[0:8]
+           | map("\(.r)=\(.n)") | join("  ")' "$out" 2>/dev/null \
+      | sed 's/^/  Top repo  : /' >&2
+  fi
+  rm -f "$out"; SAST_LOOKBACK_DAYS="$_lb_prev"
+}
+
+# Lists the repository identifiers that ACTUALLY exist on the cicodescan track.
+#
+# This exists because `@git.repository.name` was a guess. The only field the
+# working SAST gate ever used is `@git.repository.id`, and a filter on a field
+# that is not a facet on this track returns zero rows with no error - which is
+# indistinguishable from "no violations". Rather than guess again, read the
+# identifiers out of the data and let the person pick one verbatim.
+cmd_sast_repos() {
+  need_auth
+  local days="${1:-90}"
+  local prev="$SAST_LOOKBACK_DAYS"
+  SAST_LOOKBACK_DAYS="$days"
+
+  step "Collecting repo identifiers from the cicodescan track (${days} days)..."
+  local out; out="$(mktemp)"
+  # Non-strict: only the set of identifiers matters, not a complete row count.
+  if ! dd_cicodescan '@static_analysis.result.item_type:static_analysis_violation' "$out" false; then
+    SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"; return 1
+  fi
+
+  local n; n="$(jq -r '.result.events | length' "$out")"
+  if [ "$n" -eq 0 ]; then
+    warn "0 events on the cicodescan track in ${days} days."
+    dim "  This means it is not a wrong repo filter - there simply is no SAST data"
+    dim "  reaching this track. Check:"
+    dim "    - Is Code Security enabled for those repos in Datadog?"
+    dim "    - Does the app key have code_analysis_read? ($PROG auth probe)"
+    dim "    - Correct site? Currently: ${DD_SITE_R}"
+    SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"; return 0
+  fi
+
+  hdr "Repo identifiers present in the data ($n events inspected)"
+  info "  Use the values below AS-IS."
+  info ""
+  printf '  %-14s %s\n' "FIELD" "VALUE (event count)" >&2
+  jq -r '
+    [ .result.events[]? | .event.custom?.git? // {} ]
+    | ( [ .[] | .repository?.id?  | select(type=="string" and . != "") ] ) as $ids
+    | ( [ .[] | .repository?.name? | select(type=="string" and . != "") ] ) as $names
+    | ( [ .[] | .branch?          | select(type=="string" and . != "") ] ) as $brs
+    | ( ($ids   | group_by(.) | map("repository.id\u0009\(.[0])  (\(length))"))
+      + ($names | group_by(.) | map("repository.name\u0009\(.[0])  (\(length))"))
+      + ($brs   | group_by(.) | map("branch\u0009\(.[0])  (\(length))")) )
+    | .[]' "$out" \
+    | awk -F'\t' '{ printf "  %-14s %s\n", $1, $2 }' >&2
+
+  info ""
+  dim "  If a 'repository.name' row does NOT appear at all, that field is not"
+  dim "  present on this track - use --repo-id with a repository.id value above."
+  dim "  Example:"
+  local sample
+  sample="$(jq -r '[.result.events[]?.event.custom?.git?.repository?.id? | select(type=="string" and . != "")][0] // ""' "$out")"
+  [ -z "$sample" ] || dim "    $PROG sast list --repo-id '$sample'"
+  SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"
+}
+
+# Runs the query with filters added ONE AT A TIME and prints the count after
+# each. The step where the count drops to zero is the filter that is wrong.
+#
+# This is the whole diagnosis for "0 violation but there should be some":
+# guessing which of five ANDed filters is at fault is hopeless, measuring is
+# trivial.
+cmd_sast_probe() {
+  need_auth
+  local repo="" repo_id="" branch="" days="${SAST_LOOKBACK_DAYS}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --repo-id) repo_id="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --days) days="$2"; shift 2 ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  local prev="$SAST_LOOKBACK_DAYS"; SAST_LOOKBACK_DAYS="$days"
+
+  hdr "Filter ladder - lookback ${days} days"
+  dim "  Each line adds ONE filter. The first line that becomes 0 is"
+  dim "  the cause."
+  info ""
+
+  local q="" out zero_at=""
+  out="$(mktemp)"
+
+  _probe_step() { # label added_filter
+    local label="$1" add="$2" n
+    q="${q:+$q }$add"
+    if dd_cicodescan "$q" "$out" false >/dev/null 2>&1; then
+      n="$(jq -r '.result.events | length' "$out")"
+    else
+      n="ERR"
+    fi
+    if [ "$n" = "ERR" ]; then
+      printf '  %s✗%s %-44s query failed\n' "$C_RED" "$C_OFF" "$label" >&2
+    elif [ "$n" = "0" ]; then
+      printf '  %s✗%s %-44s 0\n' "$C_RED" "$C_OFF" "$label" >&2
+      [ -n "$zero_at" ] || zero_at="$label"
+    else
+      printf '  %s✓%s %-44s %s\n' "$C_GRN" "$C_OFF" "$label" "$n" >&2
+    fi
+  }
+
+  _probe_step "item_type:static_analysis_violation" \
+    "@static_analysis.result.item_type:static_analysis_violation"
+  _probe_step "+ not suppressed" "-@static_analysis.result.is_suppressed:true"
+  _probe_step "+ not a testing rule" "-@static_analysis.rule.is_testing:true"
+
+  if [ -n "$repo_id" ]; then
+    _probe_step "+ repository.id:$repo_id" "@git.repository.id:${repo_id}"
+  fi
+  if [ -n "$repo" ]; then
+    _probe_step "+ repository.name:$repo" "@git.repository.name:${repo}"
+    # A name that is not a facet returns nothing; a wildcard against the id is
+    # the fallback that usually does match, since the id ends with the name.
+    local qsave="$q"
+    q="${q% @git.repository.name:${repo}}"
+    _probe_step "+ repository.id:*${repo}* (wildcard)" "@git.repository.id:*${repo}*"
+    [ "$(jq -r '.result.events | length' "$out" 2>/dev/null || echo 0)" != "0" ] || q="$qsave"
+  fi
+  [ -z "$branch" ] || _probe_step "+ branch:$branch" "@git.branch:${branch}"
+  _probe_step "+ category:security" "@static_analysis.result.category:security"
+
+  info ""
+  if [ -n "$zero_at" ]; then
+    warn "The filter that kills the result: $zero_at"
+    case "$zero_at" in
+      *repository.name*)
+        dim "  @git.repository.name appears NOT to be a field on the cicodescan track."
+        dim "  Use --repo-id. See valid values:"
+        dim "    $PROG sast repos" ;;
+      *repository.id*)
+        dim "  The repository.id value does not match. It is the full host+path,"
+        dim "  e.g. gitlab.example.com/team/app. See what is in the data:"
+        dim "    $PROG sast repos" ;;
+      *branch*)
+        dim "  The branch name does not match, or that branch was never scanned." ;;
+      *category*)
+        dim "  There are violations, but NONE are security category - all"
+        dim "  code_style or other categories. That proves the scan landed."
+        dim "  Lihat semuanya: $PROG sast list --all-categories" ;;
+      *item_type*)
+        dim "  No SAST events at all in the last ${days} days."
+        dim "  Raise --days, or check code_analysis_read and DD_SITE." ;;
+      *) dim "  See what actually exists in the data: $PROG sast repos" ;;
+    esac
+  else
+    ok "All filters pass - the full query returns results."
+    dim "  If 'sast list' is still 0, report it: that means a bug in this tool."
+  fi
+  rm -f "$out"; SAST_LOOKBACK_DAYS="$prev"
+}
+
+# -----------------------------------------------------------------------------
+# report  -  posture report generator  (BETA)
+#
+# Pulls the same data the interactive views show - security findings and, when
+# the app key allows it, SAST (cicodescan) violations - and renders ONE
+# point-in-time report in Markdown (default), self-contained HTML, or JSON.
+#
+# READ-ONLY by construction. report never mutates a finding; it needs only the
+# *_read permissions. A section whose permission is missing is marked
+# "unavailable" in the output rather than aborting the whole run - a partial
+# report is more useful than none, as long as it says what is partial.
+#
+#   dd-sec report                                  # Markdown to stdout
+#   dd-sec report --format html --out posture.html
+#   dd-sec report --query '@status:open @severity:(high OR critical)' --days 90
+# -----------------------------------------------------------------------------
+_rep_md_cell() { printf '%s' "$1" | tr '\n\t' '  ' | sed 's/|/\\|/g'; }
+_rep_html_esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+_rep_up() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+cmd_report() {
+  need_auth
+  local query='@status:open' days="$SAST_LOOKBACK_DAYS" fmt="md" out="" title=""
+  local topn=25 max=1000 do_sast=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --query)   query="$2"; shift 2 ;;
+      --days)    days="$2"; shift 2 ;;
+      --format)  fmt="$2"; shift 2 ;;
+      --out)     out="$2"; shift 2 ;;
+      --title)   title="$2"; shift 2 ;;
+      --top)     topn="$2"; shift 2 ;;
+      --limit)   max="$2"; shift 2 ;;
+      --no-sast) do_sast=0; shift ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  case "$fmt"  in md|html|json) : ;; *) die "--format must be md|html|json" ;; esac
+  case "$days" in ''|*[!0-9]*) die "--days must be a number" ;; esac
+  case "$topn" in ''|*[!0-9]*) die "--top must be a number" ;; esac
+  case "$max"  in ''|*[!0-9]*) die "--limit must be a number" ;; esac
+  [ -n "$title" ] || title="Datadog Security Posture Report"
+
+  local genat; genat="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # --- findings (the one section that must succeed) --------------------------
+  step "Collecting security findings (query: $query)"
+  local ftsv; ftsv="$(mktemp)"
+  findings_fetch "$query" "$max" > "$ftsv" || { rm -f "$ftsv"; die "Failed to fetch findings. Check: $PROG auth probe"; }
+
+  local F_TOT=0 F_CRIT=0 F_HIGH=0 F_MED=0 F_LOW=0 F_INFO=0 F_UNK=0
+  eval "$(awk -F'\t' '
+    { tot++; s=tolower($2)
+      if      (s=="critical") c++
+      else if (s=="high")     h++
+      else if (s=="medium")   m++
+      else if (s=="low")      l++
+      else if (s=="info"||s=="none"||s=="info_none") i++
+      else u++ }
+    END { printf "F_TOT=%d;F_CRIT=%d;F_HIGH=%d;F_MED=%d;F_LOW=%d;F_INFO=%d;F_UNK=%d\n",
+          tot+0,c+0,h+0,m+0,l+0,i+0,u+0 }' "$ftsv")"
+
+  # status breakdown, most common first
+  local fstatus; fstatus="$(mktemp)"
+  awk -F'\t' '{ s=$3; if (s=="") s="(none)"; cnt[s]++ }
+    END { for (k in cnt) printf "%d\t%s\n", cnt[k], k }' "$ftsv" \
+    | sort -rn > "$fstatus"
+
+  # top findings, severity-ranked, capped at --top
+  local ftop; ftop="$(mktemp)"
+  awk -F'\t' 'BEGIN{OFS="\t"}
+    { s=tolower($2); r=7
+      if      (s=="critical") r=1
+      else if (s=="high")     r=2
+      else if (s=="medium")   r=3
+      else if (s=="low")      r=4
+      else if (s=="info"||s=="none"||s=="info_none") r=5
+      else if (s=="")         r=6
+      print r, $0 }' "$ftsv" \
+    | sort -t"$(printf '\t')" -k1,1n -s | cut -f2- | head -n "$topn" > "$ftop"
+
+  # --- SAST (optional, degrades to "unavailable") ----------------------------
+  local S_TOT=0 S_CRIT=0 S_HIGH=0 S_MED=0 S_LOW=0 S_INFO=0 sast_ok=0
+  local stops; stops="$(mktemp)"; : > "$stops"
+  if [ "$do_sast" -eq 1 ]; then
+    step "Collecting SAST violations (cicodescan, ${days}-day lookback)"
+    local _prev="$SAST_LOOKBACK_DAYS"; SAST_LOOKBACK_DAYS="$days"
+    local sout; sout="$(mktemp)"
+    local sq='@static_analysis.result.item_type:static_analysis_violation -@static_analysis.result.is_suppressed:true -@static_analysis.rule.is_testing:true @static_analysis.result.category:security'
+    if dd_cicodescan "$sq" "$sout" false >/dev/null 2>&1; then
+      sast_ok=1
+      eval "$(jq -r '
+        [ .result.events[]? | .event.custom?.static_analysis?.result?.k9_severity? // "unknown" | ascii_downcase ] as $s
+        | "S_TOT=\($s|length)"
+        + ";S_CRIT=\($s|map(select(.==\"critical\"))|length)"
+        + ";S_HIGH=\($s|map(select(.==\"high\"))|length)"
+        + ";S_MED=\($s|map(select(.==\"medium\"))|length)"
+        + ";S_LOW=\($s|map(select(.==\"low\"))|length)"
+        + ";S_INFO=\($s|map(select(.==\"info\" or .==\"notice\"))|length)"
+      ' "$sout" 2>/dev/null)"
+      jq -r '
+        [ .result.events[]? | .event.custom?.git?.repository?.name?
+          // .event.custom?.git?.repository?.id? // "?" ]
+        | group_by(.) | map({r:.[0], n:length}) | sort_by(-.n) | .[0:10]
+        | .[] | "\(.n)\t\(.r)"' "$sout" 2>/dev/null > "$stops"
+    else
+      warn "SAST section unavailable (missing code_analysis_read / endpoint error) - continuing without it."
+    fi
+    rm -f "$sout"; SAST_LOOKBACK_DAYS="$_prev"
+  fi
+
+  # --- render ----------------------------------------------------------------
+  local rep; rep="$(mktemp)"
+  local beta='dd-sec is in BETA testing. Treat this report as advisory: verify findings in the Datadog UI before acting on them. The SAST section reads an undocumented endpoint whose result ceiling is not guaranteed.'
+
+  if [ "$fmt" = "json" ]; then
+    jq -n \
+      --arg title "$title" --arg org "${ORG_NAME:-}" --arg site "${DD_SITE_R:-}" \
+      --arg gen "$genat" --arg query "$query" --arg ver "$VERSION" --arg beta "$beta" \
+      --argjson days "$days" \
+      --argjson ftot "$F_TOT" --argjson fcrit "$F_CRIT" --argjson fhigh "$F_HIGH" \
+      --argjson fmed "$F_MED" --argjson flow "$F_LOW" --argjson finfo "$F_INFO" --argjson funk "$F_UNK" \
+      --argjson sastok "$sast_ok" --argjson stot "$S_TOT" --argjson scrit "$S_CRIT" \
+      --argjson shigh "$S_HIGH" --argjson smed "$S_MED" --argjson slow "$S_LOW" --argjson sinfo "$S_INFO" \
+      --rawfile ftop "$ftop" --rawfile stops "$stops" --rawfile fstatus "$fstatus" \
+      '{
+        meta: { title:$title, generated_utc:$gen, tool:"dd-sec", version:$ver,
+                beta_notice:$beta, organization:$org, site:$site,
+                findings_query:$query, sast_lookback_days:$days },
+        findings: {
+          total:$ftot,
+          by_severity: { critical:$fcrit, high:$fhigh, medium:$fmed, low:$flow, info:$finfo, unknown:$funk },
+          by_status: ( $fstatus | split("\n") | map(select(length>0)) | map(split("\t"))
+                       | map({ status:.[1], count:(.[0]|tonumber) }) ),
+          top: ( $ftop | split("\n") | map(select(length>0)) | map(split("\t"))
+                 | map({ id:.[0], severity:.[1], status:.[2], title:.[3], resource:.[4] }) )
+        },
+        sast: {
+          available:($sastok==1),
+          total:$stot,
+          by_severity: { critical:$scrit, high:$shigh, medium:$smed, low:$slow, info:$sinfo },
+          top_repositories: ( $stops | split("\n") | map(select(length>0)) | map(split("\t"))
+                              | map({ repository:.[1], violations:(.[0]|tonumber) }) )
+        }
+      }' > "$rep"
+
+  elif [ "$fmt" = "html" ]; then
+    {
+      cat <<HTMLHEAD
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$(_rep_html_esc "$title")</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1f24; --muted:#5a6572; --line:#e4e8ec; --card:#f7f9fb;
+          --crit:#b31515; --high:#e8640c; --med:#c99700; --low:#2f7d32; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1116; --fg:#e6edf3; --muted:#9aa5b1; --line:#242b33; --card:#161b22; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg);
+         font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:900px; margin:0 auto; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.2rem; margin:2rem 0 .75rem; border-bottom:1px solid var(--line); padding-bottom:.3rem; }
+  h3 { font-size:1rem; margin:1.3rem 0 .5rem; }
+  .beta { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--high);
+          padding:.6rem .9rem; border-radius:6px; color:var(--muted); font-size:.9rem; margin:1rem 0 1.5rem; }
+  table { border-collapse:collapse; width:100%; margin:.5rem 0 1rem; font-size:.92rem; }
+  th,td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:.8rem; text-transform:uppercase; letter-spacing:.03em; }
+  .meta td:first-child { color:var(--muted); width:11rem; }
+  .chip { display:inline-block; padding:.08rem .5rem; border-radius:999px; font-size:.78rem;
+          font-weight:700; color:#fff; }
+  .CRITICAL{background:var(--crit);} .HIGH{background:var(--high);} .MEDIUM{background:var(--med);}
+  .LOW{background:var(--low);} .INFO{background:var(--muted);} .UNKNOWN{background:var(--muted);}
+  code { background:var(--card); padding:.1rem .35rem; border-radius:4px; font-size:.85em; }
+  .cards { display:flex; flex-wrap:wrap; gap:.6rem; margin:.5rem 0 1rem; }
+  .card { flex:1 1 7rem; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:.7rem .9rem; }
+  .card .n { font-size:1.5rem; font-weight:700; } .card .l { color:var(--muted); font-size:.8rem; }
+  footer { margin-top:2.5rem; color:var(--muted); font-size:.82rem; border-top:1px solid var(--line); padding-top:1rem; }
+</style></head><body><main>
+<h1>$(_rep_html_esc "$title")</h1>
+<div class="beta"><strong>BETA</strong> &mdash; $(_rep_html_esc "$beta")</div>
+<table class="meta">
+<tr><td>Organization</td><td>$(_rep_html_esc "${ORG_NAME:-?}")</td></tr>
+<tr><td>Datadog site</td><td>$(_rep_html_esc "${DD_SITE_R:-?}")</td></tr>
+<tr><td>Generated (UTC)</td><td>$genat</td></tr>
+<tr><td>Findings query</td><td><code>$(_rep_html_esc "$query")</code></td></tr>
+<tr><td>SAST lookback</td><td>${days} days</td></tr>
+<tr><td>Tool version</td><td>dd-sec $VERSION</td></tr>
+</table>
+<h2>Executive summary</h2>
+<div class="cards">
+  <div class="card"><div class="n">$F_TOT</div><div class="l">Open findings</div></div>
+  <div class="card"><div class="n">$(( F_CRIT + F_HIGH ))</div><div class="l">Critical + High</div></div>
+  <div class="card"><div class="n">$( [ "$sast_ok" -eq 1 ] && printf '%s' "$S_TOT" || printf 'n/a' )</div><div class="l">SAST violations</div></div>
+</div>
+<h2>Security findings &mdash; severity distribution</h2>
+<table><tr><th>Severity</th><th>Count</th></tr>
+<tr><td><span class="chip CRITICAL">CRITICAL</span></td><td>$F_CRIT</td></tr>
+<tr><td><span class="chip HIGH">HIGH</span></td><td>$F_HIGH</td></tr>
+<tr><td><span class="chip MEDIUM">MEDIUM</span></td><td>$F_MED</td></tr>
+<tr><td><span class="chip LOW">LOW</span></td><td>$F_LOW</td></tr>
+<tr><td><span class="chip INFO">INFO</span></td><td>$F_INFO</td></tr>
+<tr><td><span class="chip UNKNOWN">UNKNOWN</span></td><td>$F_UNK</td></tr>
+</table>
+<h2>Top findings (up to $topn, severity-ranked)</h2>
+<table><tr><th>#</th><th>Severity</th><th>Status</th><th>Finding</th><th>Resource</th></tr>
+HTMLHEAD
+      local _n=0 id sev st ti rs
+      while IFS=$'\t' read -r id sev st ti rs; do
+        [ -n "$id" ] || continue
+        _n=$(( _n + 1 ))
+        local sv; sv="$(_rep_up "${sev:-unknown}")"; [ -n "$sev" ] || sv="UNKNOWN"
+        printf '<tr><td>%d</td><td><span class="chip %s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
+          "$_n" "$sv" "$sv" "$(_rep_html_esc "${st:--}")" "$(_rep_html_esc "${ti:--}")" "$(_rep_html_esc "${rs:--}")"
+      done < "$ftop"
+      printf '</table>\n'
+
+      printf '<h2>SAST violations (cicodescan)</h2>\n'
+      if [ "$sast_ok" -eq 1 ]; then
+        cat <<HTMLSAST
+<div class="cards">
+  <div class="card"><div class="n">$S_TOT</div><div class="l">Total</div></div>
+  <div class="card"><div class="n">$S_CRIT</div><div class="l">Critical</div></div>
+  <div class="card"><div class="n">$S_HIGH</div><div class="l">High</div></div>
+  <div class="card"><div class="n">$S_MED</div><div class="l">Medium</div></div>
+</div>
+<h3>Top repositories by violation count</h3>
+<table><tr><th>Repository</th><th>Violations</th></tr>
+HTMLSAST
+        local rn rr
+        while IFS=$'\t' read -r rn rr; do
+          [ -n "$rn" ] || continue
+          printf '<tr><td>%s</td><td>%s</td></tr>\n' "$(_rep_html_esc "$rr")" "$rn"
+        done < "$stops"
+        printf '</table>\n'
+      else
+        printf '<p><em>Unavailable.</em> The app key lacks <code>code_analysis_read</code>, or the cicodescan endpoint returned an error. Findings above are unaffected.</p>\n'
+      fi
+
+      cat <<HTMLFOOT
+<footer>
+Generated by dd-sec $VERSION on $genat. Methodology: findings via
+<code>GET /api/v2/security/findings</code>; SAST via the internal
+<code>logs-analytics</code> (cicodescan) endpoint over a ${days}-day window.
+Zero SAST violations is not proof of clean code &mdash; a repository last scanned
+outside the lookback window reads as zero here. All data is point-in-time.
+</footer>
+</main></body></html>
+HTMLFOOT
+    } > "$rep"
+
+  else   # markdown (default)
+    {
+      printf '# %s\n\n' "$title"
+      printf '> **BETA** — %s\n\n' "$beta"
+      printf '| | |\n|---|---|\n'
+      printf '| Organization | %s |\n' "$(_rep_md_cell "${ORG_NAME:-?}")"
+      printf '| Datadog site | %s |\n' "$(_rep_md_cell "${DD_SITE_R:-?}")"
+      printf '| Generated (UTC) | %s |\n' "$genat"
+      printf '| Findings query | `%s` |\n' "$(_rep_md_cell "$query")"
+      printf '| SAST lookback | %s days |\n' "$days"
+      printf '| Tool version | dd-sec %s |\n\n' "$VERSION"
+
+      printf '## Executive summary\n\n'
+      printf -- '- **%s** open findings matched the query.\n' "$F_TOT"
+      printf -- '- **%s critical** and **%s high** severity.\n' "$F_CRIT" "$F_HIGH"
+      if [ "$sast_ok" -eq 1 ]; then
+        printf -- '- **%s** SAST violations (security category) in the last %s days.\n\n' "$S_TOT" "$days"
+      else
+        printf -- '- SAST section unavailable (see below).\n\n'
+      fi
+
+      printf '## Security findings — severity distribution\n\n'
+      printf '| Severity | Count |\n|---|---:|\n'
+      printf '| CRITICAL | %s |\n| HIGH | %s |\n| MEDIUM | %s |\n| LOW | %s |\n| INFO | %s |\n| UNKNOWN | %s |\n\n' \
+        "$F_CRIT" "$F_HIGH" "$F_MED" "$F_LOW" "$F_INFO" "$F_UNK"
+
+      printf '### Status breakdown\n\n'
+      printf '| Status | Count |\n|---|---:|\n'
+      local sc sn
+      while IFS=$'\t' read -r sc sn; do
+        [ -n "$sc" ] || continue
+        printf '| %s | %s |\n' "$(_rep_md_cell "$sn")" "$sc"
+      done < "$fstatus"
+      printf '\n'
+
+      printf '### Top findings (up to %s, severity-ranked)\n\n' "$topn"
+      printf '| # | Severity | Status | Finding | Resource |\n|---:|---|---|---|---|\n'
+      local _n=0 id sev st ti rs
+      while IFS=$'\t' read -r id sev st ti rs; do
+        [ -n "$id" ] || continue
+        _n=$(( _n + 1 ))
+        printf '| %d | %s | %s | %s | %s |\n' "$_n" "$(_rep_up "${sev:-unknown}")" \
+          "$(_rep_md_cell "${st:--}")" "$(_rep_md_cell "${ti:--}")" "$(_rep_md_cell "${rs:--}")"
+      done < "$ftop"
+      printf '\n'
+
+      printf '## SAST violations (cicodescan)\n\n'
+      if [ "$sast_ok" -eq 1 ]; then
+        printf '| Severity | Count |\n|---|---:|\n'
+        printf '| CRITICAL | %s |\n| HIGH | %s |\n| MEDIUM | %s |\n| LOW | %s |\n| INFO | %s |\n| **Total** | **%s** |\n\n' \
+          "$S_CRIT" "$S_HIGH" "$S_MED" "$S_LOW" "$S_INFO" "$S_TOT"
+        printf '### Top repositories by violation count\n\n'
+        printf '| Repository | Violations |\n|---|---:|\n'
+        local rn rr
+        while IFS=$'\t' read -r rn rr; do
+          [ -n "$rn" ] || continue
+          printf '| %s | %s |\n' "$(_rep_md_cell "$rr")" "$rn"
+        done < "$stops"
+        printf '\n'
+      else
+        printf '_Unavailable._ The app key lacks `code_analysis_read`, or the cicodescan endpoint returned an error. The findings above are unaffected.\n\n'
+      fi
+
+      printf '## Methodology & caveats\n\n'
+      printf -- '- **Findings**: `GET /api/v2/security/findings` with the query above, paginated.\n'
+      printf -- '- **SAST**: the internal `logs-analytics` (cicodescan) endpoint over a %s-day window. This endpoint is undocumented and its result ceiling is not guaranteed stable.\n' "$days"
+      printf -- '- **Zero is not clean**: a repository last scanned outside the lookback window reads as zero here even if the UI still shows findings.\n'
+      printf -- '- **Point-in-time**: finding IDs change between scans; regenerate before acting.\n'
+      printf -- '- Generated by `dd-sec %s`, read-only. No findings were modified.\n' "$VERSION"
+    } > "$rep"
+  fi
+
+  rm -f "$ftsv" "$ftop" "$fstatus" "$stops"
+
+  if [ -n "$out" ]; then
+    mv "$rep" "$out"; ok "Report written: $out"
+    dim "  Format: $fmt · $F_TOT finding(s)$( [ "$sast_ok" -eq 1 ] && printf ', %s SAST violation(s)' "$S_TOT")"
+  else
+    cat "$rep"; rm -f "$rep"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Interactive menu
+# -----------------------------------------------------------------------------
+# =============================================================================
+# ARROW-KEY UI
+#
+# Every menu and every choice with a knowable set of values is a cursor
+# selection, not typed text. That is not a cosmetic preference: three separate
+# bugs in this tool came from sequential `read` prompts, and they were all the
+# same bug. A pasted value carrying a leading newline satisfies the first read
+# and pushes the real value into the next prompt; a pasted value WITHOUT a
+# trailing newline lets the next thing typed run onto the same line, producing
+# "...vulnerable-java-appmain". No amount of validation fixes input that was
+# never separable in the first place.
+#
+# Typing is therefore reserved for what genuinely cannot be enumerated: a
+# Datadog query, a justification, a custom value chosen from the list itself.
+# =============================================================================
+
+UI_INDEX=0      # 0-based index of the chosen entry
+UI_VALUE=""     # its label
+UI_CANCELLED=0
+
+# Drawn on the terminal via stderr, since stdout may be captured by a caller.
+_ui_hide() { printf '\033[?25l' >&2; }
+_ui_show() { printf '\033[?25h' >&2; }
+
+# ui_select TITLE OPTION...
+#   Up/Down or k/j to move, Enter to choose, 1-9 to jump, q or Esc to cancel.
+#   Sets UI_INDEX / UI_VALUE, or UI_CANCELLED=1 and returns 1.
+#
+# Without a usable terminal this degrades to a numbered prompt rather than
+# failing, so the same code path works over a pipe and in CI.
+ui_select() {
+  local title="$1"; shift
+  local n=$# i cur=0 key rest cols
+  UI_CANCELLED=0; UI_INDEX=0; UI_VALUE=""
+  [ "$n" -gt 0 ] || return 1
+
+  local opts=("$@")
+
+  if [ ! -t 0 ] || [ -n "${DD_SEC_NO_TUI:-}" ]; then
+    printf '\n%s%s%s\n' "$C_BLD" "$title" "$C_OFF" >&2
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      printf '  %d) %s\n' "$(( i + 1 ))" "${opts[$i]}" >&2
+      i=$(( i + 1 ))
+    done
+    printf '\n  Select [1-%d]: ' "$n" >&2
+    local pick; IFS= read -r pick || { UI_CANCELLED=1; return 1; }
+    case "$pick" in
+      ''|*[!0-9]*) UI_CANCELLED=1; return 1 ;;
+    esac
+    [ "$pick" -ge 1 ] && [ "$pick" -le "$n" ] || { UI_CANCELLED=1; return 1; }
+    UI_INDEX=$(( pick - 1 )); UI_VALUE="${opts[$UI_INDEX]}"
+    return 0
+  fi
+
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  [ "$cols" -gt 20 ] 2>/dev/null || cols=80
+  local width=$(( cols - 8 ))
+
+  printf '\n%s%s%s\n' "$C_BLD" "$title" "$C_OFF" >&2
+  dim "  ↑/↓ move · Enter select · q cancel"
+
+  _ui_draw() {
+    local j=0 label
+    while [ "$j" -lt "$n" ]; do
+      label="${opts[$j]}"
+      [ "${#label}" -le "$width" ] || label="${label:0:$width}…"
+      if [ "$j" -eq "$cur" ]; then
+        printf '\033[2K  %s❯ %s%s\n' "$C_CYN" "$label" "$C_OFF" >&2
+      else
+        printf '\033[2K    %s\n' "$label" >&2
+      fi
+      j=$(( j + 1 ))
+    done
+  }
+
+  # The cursor is restored even if the caller is interrupted mid-selection;
+  # a terminal left without a cursor is a hostile thing to leave behind.
+  trap '_ui_show; trap - INT TERM; return 130' INT TERM
+  _ui_hide
+  _ui_draw
+
+  while :; do
+    IFS= read -rsn1 key 2>/dev/null || { key=q; }
+    case "$key" in
+      $'\033')
+        # An arrow is ESC [ A/B. A bare Esc has no follow-up, so the short
+        # timeout is what distinguishes "cancel" from "arrow key".
+        rest=""
+        IFS= read -rsn2 -t 1 rest 2>/dev/null
+        case "$rest" in
+          '[A') cur=$(( cur > 0 ? cur - 1 : n - 1 )) ;;
+          '[B') cur=$(( cur < n - 1 ? cur + 1 : 0 )) ;;
+          '')   UI_CANCELLED=1; break ;;
+          *)    : ;;
+        esac ;;
+      '')            UI_INDEX="$cur"; UI_VALUE="${opts[$cur]}"; break ;;
+      k|K)           cur=$(( cur > 0 ? cur - 1 : n - 1 )) ;;
+      j|J)           cur=$(( cur < n - 1 ? cur + 1 : 0 )) ;;
+      g)             cur=0 ;;
+      G)             cur=$(( n - 1 )) ;;
+      q|Q)           UI_CANCELLED=1; break ;;
+      [1-9])
+        if [ "$key" -le "$n" ]; then
+          cur=$(( key - 1 )); UI_INDEX="$cur"; UI_VALUE="${opts[$cur]}"; break
+        fi ;;
+      *) : ;;
+    esac
+    printf '\033[%dA' "$n" >&2
+    _ui_draw
+  done
+
+  _ui_show
+  trap - INT TERM
+  if [ "$UI_CANCELLED" -eq 1 ]; then
+    printf '\033[%dA' "$n" >&2
+    cur=-1; _ui_draw
+    dim "  (cancelled)"
+    return 1
+  fi
+  return 0
+}
+
+# ui_text PROMPT [DEFAULT] -> UI_VALUE
+# Kept for the things that genuinely cannot be enumerated: a query, a reason,
+# a custom value. Reads on its own line so nothing can run onto it, and trims
+# whitespace so a paste with stray newlines cannot shift anything.
+ui_text() {
+  local prompt="$1" def="${2:-}"
+  UI_VALUE=""; UI_CANCELLED=0
+  if [ -n "$def" ]; then printf '\n  %s%s%s [%s]\n  > ' "$C_BLD" "$prompt" "$C_OFF" "$def" >&2
+  else printf '\n  %s%s%s\n  > ' "$C_BLD" "$prompt" "$C_OFF" >&2; fi
+  local v=""
+  IFS= read -r v || { UI_CANCELLED=1; return 1; }
+  v="$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ -n "$v" ] || v="$def"
+  UI_VALUE="$v"
+  [ -n "$UI_VALUE" ] || return 1
+  return 0
+}
+
+ui_confirm() { # question [default_yes]
+  local q="$1" dflt="${2:-yes}" first second
+  if [ "$dflt" = "yes" ]; then first="Yes"; second="No"; else first="No"; second="Yes"; fi
+  ui_select "$q" "$first" "$second" || return 1
+  [ "$UI_VALUE" = "Yes" ]
+}
+
+# Distinct repository ids present on the cicodescan track, newest window first.
+# Reading the identifiers out of the data is the only reliable way to get them:
+# the exact string Datadog holds is host+path, and no amount of guessing at
+# @git.repository.name produces it.
+sast_repo_list() { # days
+  local days="${1:-90}" prev="$SAST_LOOKBACK_DAYS" out
+  SAST_LOOKBACK_DAYS="$days"
+  out="$(mktemp)"
+  if ! dd_cicodescan '@static_analysis.result.item_type:static_analysis_violation' "$out" false >/dev/null 2>&1; then
+    SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"; return 1
+  fi
+  jq -r '[ .result.events[]? | .event.custom?.git?.repository?.id?
+           | select(type == "string" and . != "") ]
+         | group_by(.) | map({r: .[0], n: length}) | sort_by(-.n)
+         | .[] | "\(.r)\t\(.n)"' "$out" 2>/dev/null
+  SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"
+}
+
+sast_branch_list() { # repo_id days
+  local rid="$1" days="${2:-90}" prev="$SAST_LOOKBACK_DAYS" out
+  SAST_LOOKBACK_DAYS="$days"
+  out="$(mktemp)"
+  local q="@static_analysis.result.item_type:static_analysis_violation"
+  [ -z "$rid" ] || q="$q @git.repository.id:${rid}"
+  if ! dd_cicodescan "$q" "$out" false >/dev/null 2>&1; then
+    SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"; return 1
+  fi
+  jq -r '[ .result.events[]? | .event.custom?.git?.branch?
+           | select(type == "string" and . != "") ]
+         | group_by(.) | map({b: .[0], n: length}) | sort_by(-.n)
+         | .[] | "\(.b)\t\(.n)"' "$out" 2>/dev/null
+  SAST_LOOKBACK_DAYS="$prev"; rm -f "$out"
+}
+
+pause() { [ -t 0 ] || return 0; printf '\n%s  [enter to continue]%s' "$C_DIM" "$C_OFF" >&2; IFS= read -r _ || true; }
+
+
+
+banner() {
+  load_creds
+  local who="not logged in"
+  [ -z "$DD_API_KEY_R" ] || who="${ORG_NAME:-?} @ ${DD_SITE_R:-?}"
+  printf '\n%s┌─ dd-sec %s%s\n' "$C_CYN" "$VERSION" "$C_OFF" >&2
+  printf '%s│%s  %s\n' "$C_CYN" "$C_OFF" "$who" >&2
+  [ -z "$SEV_MODE" ] || printf '%s│%s  severity mode: %s\n' "$C_CYN" "$C_OFF" "$SEV_MODE" >&2
+  printf '%s└─%s\n' "$C_CYN" "$C_OFF" >&2
+}
+
+menu_findings() {
+  while :; do
+    ui_select "Findings" \
+      "All open findings (general)" \
+      "Filter by severity" \
+      "Filter by query (type manually)" \
+      "Detail of one finding (#N)" \
+      "Export to file for bulk review" \
+      "SAST violations (cicodescan)" \
+      "Attribute layout (debug empty columns)" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) run_action cmd_findings_list --query '@status:open' --limit 100; pause ;;
+      1) ui_select "Severity" critical high medium low "← Cancel" || continue
+         [ "$UI_INDEX" -le 3 ] || continue
+         run_action cmd_findings_list --query "@status:open @severity:$UI_VALUE" --limit 200; pause ;;
+      2) ui_text "Datadog query" '@status:open' || continue
+         run_action cmd_findings_list --query "$UI_VALUE" --limit 200; pause ;;
+      3) local nmax
+         nmax="$(pick_count)"
+         if [ "${nmax:-0}" -eq 0 ]; then warn "No list yet. Run a listing first."; pause; continue; fi
+         ui_text "Row number (1-$nmax)" "1" || continue
+         run_action cmd_findings_show "$UI_VALUE"; pause ;;
+      4) ui_text "Query" '@status:open' || continue
+         local eq="$UI_VALUE"
+         ui_text "Save to file" "recast.tsv" || continue
+         run_action cmd_findings_list --query "$eq" --limit 500 --export "$UI_VALUE"; pause ;;
+      5) menu_sast ;;
+      6) ui_text "Query (empty = any finding)" "" \
+           && run_action cmd_findings_keys --query "$UI_VALUE" \
+           || run_action cmd_findings_keys
+         pause ;;
+      7) return 0 ;;
+    esac
+  done
+}
+
+# Repo and branch are CHOSEN FROM THE DATA, never typed. That removes the whole
+# class of failure this menu kept producing: a repo id pasted into the branch
+# prompt, or a branch typed onto the end of a pasted repo id. It also removes
+# the guessing - the identifiers offered are the exact strings Datadog holds.
+menu_sast() {
+  local sast_days=30
+  while :; do
+    ui_select "SAST violations (cicodescan) · lookback ${sast_days} days" \
+      "General - all repos (org-wide)" \
+      "Pick a repo from the data" \
+      "General, all categories (including code_style)" \
+      "Change lookback (currently ${sast_days} days)" \
+      "Repo identifiers present in the data" \
+      "Probe filters - find which filter kills the result" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) run_action cmd_sast_list --days "$sast_days"; pause ;;
+      1) menu_sast_repo "$sast_days" ;;
+      2) run_action cmd_sast_list --days "$sast_days" --all-categories; pause ;;
+      3) ui_select "Lookback" "7 days" "30 days" "90 days" "180 days" "Type manually" "← Cancel" || continue
+         case "$UI_INDEX" in
+           0) sast_days=7 ;; 1) sast_days=30 ;; 2) sast_days=90 ;; 3) sast_days=180 ;;
+           4) ui_text "Lookback (days)" "30" || continue
+              case "$UI_VALUE" in
+                ''|*[!0-9]*) warn "Must be a number" ;;
+                *) sast_days="$UI_VALUE" ;;
+              esac ;;
+         esac ;;
+      4) run_action cmd_sast_repos "$sast_days"; pause ;;
+      5) menu_sast_probe "$sast_days" ;;
+      6) return 0 ;;
+    esac
+  done
+}
+
+menu_sast_repo() { # days
+  local days="$1" repo_id="" branch=""
+  step "Fetching the repo list from the data (${days} days)..."
+  local rl; rl="$(mktemp)"
+  sast_repo_list "$days" > "$rl" 2>/dev/null
+  local nrepo; nrepo="$(grep -c '[^[:space:]]' < "$rl" || true)"
+
+  if [ "${nrepo:-0}" -eq 0 ]; then
+    warn "No repos readable on the cicodescan track (${days} days)."
+    dim "  This does not mean the code is clean. Possibly: lookback too short,"
+    dim "  Code Security not enabled for that repo, or the app key lacks"
+    dim "  code_analysis_read. Check with: Probe filters, or $PROG auth probe"
+    rm -f "$rl"; pause; return 0
+  fi
+
+  # Labels carry the event count, so an identifier with no data is visible as
+  # such before it is chosen.
+  local labels=() ids=() line rid cnt
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\x1f' read -r rid cnt <<< "${line//$'\t'/$'\x1f'}"
+    ids+=("$rid"); labels+=("$rid  (${cnt} event)")
+  done < "$rl"
+  rm -f "$rl"
+  labels+=("← Back")
+
+  ui_select "Pick repo (${nrepo} found)" "${labels[@]}" || return 0
+  [ "$UI_INDEX" -lt "$nrepo" ] || return 0
+  repo_id="${ids[$UI_INDEX]}"
+
+  step "Fetching the branch list for that repo..."
+  local bl; bl="$(mktemp)"
+  sast_branch_list "$repo_id" "$days" > "$bl" 2>/dev/null
+  local nbr; nbr="$(grep -c '[^[:space:]]' < "$bl" || true)"
+
+  local blabels=("(all branches)") bvals=("")
+  local bname bc
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\x1f' read -r bname bc <<< "${line//$'\t'/$'\x1f'}"
+    bvals+=("$bname"); blabels+=("$bname  (${bc} event)")
+  done < "$bl"
+  rm -f "$bl"
+  blabels+=("← Cancel")
+
+  if [ "${nbr:-0}" -eq 0 ]; then
+    dim "  No branches readable; continuing without a branch filter."
+    branch=""
+  else
+    ui_select "Branch in ${repo_id##*/}" "${blabels[@]}" || return 0
+    [ "$UI_INDEX" -lt $(( nbr + 1 )) ] || return 0
+    branch="${bvals[$UI_INDEX]}"
+  fi
+
+  ui_select "Category" "Only security" "All categories (including code_style)" "← Cancel" || return 0
+  [ "$UI_INDEX" -le 1 ] || return 0
+  local allcat=0
+  [ "$UI_INDEX" -eq 1 ] && allcat=1
+
+  local args=(--days "$days" --repo-id "$repo_id")
+  [ -z "$branch" ] || args+=(--branch "$branch")
+  [ "$allcat" -eq 0 ] || args+=(--all-categories)
+
+  info ""
+  info "  repo-id : $repo_id"
+  info "  branch  : ${branch:-(all)}"
+  info "  category: $([ "$allcat" -eq 1 ] && printf 'all' || printf 'security')"
+  run_action cmd_sast_list "${args[@]}"
+  pause
+}
+
+menu_sast_probe() { # days
+  local days="$1" repo_id="" branch=""
+  ui_select "Probe filters - scope" \
+    "No repo filter (safest to start)" \
+    "Pick a repo from the data" \
+    "← Cancel" || return 0
+  case "$UI_INDEX" in
+    0) run_action cmd_sast_probe --days "$days"; pause; return 0 ;;
+    2) return 0 ;;
+  esac
+
+  local rl; rl="$(mktemp)"
+  sast_repo_list "$days" > "$rl" 2>/dev/null
+  local nrepo; nrepo="$(grep -c '[^[:space:]]' < "$rl" || true)"
+  if [ "${nrepo:-0}" -eq 0 ]; then
+    warn "No repos in the data - running the probe without a repo filter."
+    rm -f "$rl"
+    run_action cmd_sast_probe --days "$days"; pause; return 0
+  fi
+  local labels=() ids=() line rid cnt
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\x1f' read -r rid cnt <<< "${line//$'\t'/$'\x1f'}"
+    ids+=("$rid"); labels+=("$rid  (${cnt} event)")
+  done < "$rl"
+  rm -f "$rl"
+  labels+=("← Cancel")
+  ui_select "Pick repo" "${labels[@]}" || return 0
+  [ "$UI_INDEX" -lt "$nrepo" ] || return 0
+  run_action cmd_sast_probe --days "$days" --repo-id "${ids[$UI_INDEX]}"
+  pause
+}
+
+menu_recast() {
+  while :; do
+    load_creds
+    local hdr_extra=""
+    [ "$SEV_MODE" != "rule" ] || hdr_extra=" · rule mode: per-finding unavailable"
+    ui_select "Recast severity${hdr_extra}" \
+      "Pick from the last list (#N) - primary path" \
+      "Satu finding by ID" \
+      "Bulk by query" \
+      "Bulk from file (export output)" \
+      "Severity modifier rule (query-based)" \
+      "Mute / unmute" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) menu_recast_pick ;;
+      1) ui_text "Finding ID" "" || continue
+         local rid="$UI_VALUE"
+         ui_select "Severity target" info_none low medium high critical "← Cancel" || continue
+         [ "$UI_INDEX" -le 4 ] || continue
+         local rto="$UI_VALUE"
+         ui_text "Reason (required, recorded in audit trail)" "" || { warn "Reason required"; continue; }
+         local rrs="$UI_VALUE"
+         run_action cmd_recast_one --id "$rid" --to "$rto" --reason "$rrs"
+         ui_confirm "Run for real?" no \
+           && run_action cmd_recast_one --id "$rid" --to "$rto" --reason "$rrs" --apply
+         pause ;;
+      2) ui_text "Query" "" || continue
+         local rq="$UI_VALUE"
+         ui_select "Severity target" info_none low medium high critical "← Cancel" || continue
+         [ "$UI_INDEX" -le 4 ] || continue
+         local rt="$UI_VALUE"
+         ui_text "Reason (required)" "" || { warn "Reason required"; continue; }
+         local rr="$UI_VALUE"
+         run_action cmd_recast_query --query "$rq" --to "$rt" --reason "$rr"
+         ui_confirm "Run for real?" no \
+           && run_action cmd_recast_query --query "$rq" --to "$rt" --reason "$rr" --apply
+         pause ;;
+      3) ui_text "File path (tsv/csv/json)" "recast.tsv" || continue
+         local rf="$UI_VALUE"
+         run_action cmd_recast_bulk --file "$rf"
+         ui_confirm "Apply the whole file?" no && run_action cmd_recast_bulk --file "$rf" --apply
+         pause ;;
+      4) menu_rules ;;
+      5) menu_mute ;;
+      6) return 0 ;;
+    esac
+  done
+}
+
+menu_recast_pick() {
+  local nmax; nmax="$(pick_count)"
+  if [ "${nmax:-0}" -eq 0 ]; then
+    warn "No list yet. Open Findings and run a listing first."
+    pause; return 0
+  fi
+  info ""
+  dim "  Last list: $nmax rows · query: $(pick_query)"
+  ui_select "Scope" \
+    "All $nmax rows" \
+    "One row" \
+    "Row range" \
+    "Type a selection manually (1,4,9 / 2-10 / all,!7)" \
+    "← Cancel" || return 0
+  local sel=""
+  case "$UI_INDEX" in
+    0) sel="all" ;;
+    1) ui_text "Row number (1-$nmax)" "1" || return 0; sel="$UI_VALUE" ;;
+    2) ui_text "From number" "1" || return 0; local a="$UI_VALUE"
+       ui_text "To number" "$nmax" || return 0; sel="${a}-${UI_VALUE}" ;;
+    3) ui_text "Selection" "" || return 0; sel="$UI_VALUE" ;;
+    *) return 0 ;;
+  esac
+
+  ui_select "Severity target" info_none low medium high critical "← Cancel" || return 0
+  [ "$UI_INDEX" -le 4 ] || return 0
+  local to="$UI_VALUE"
+  ui_text "Reason (required, recorded in audit trail)" "" || { warn "Reason required"; pause; return 0; }
+  local rs="$UI_VALUE"
+
+  run_action cmd_recast_pick --select "$sel" --to "$to" --reason "$rs"
+  ui_confirm "Run for real?" no \
+    && run_action cmd_recast_pick --select "$sel" --to "$to" --reason "$rs" --apply
+  pause
+}
+
+menu_mute() {
+  ui_select "Direction" "Mute" "Unmute" "← Cancel" || return 0
+  local unmute=0
+  case "$UI_INDEX" in
+    0) unmute=0 ;; 1) unmute=1 ;; *) return 0 ;;
+  esac
+
+  # The reason enums differ by direction and are fixed, so they are offered as
+  # a list - an invalid reason is now unreachable rather than validated.
+  local rs=""
+  if [ "$unmute" -eq 1 ]; then
+    ui_select "Reason (unmute)" NO_PENDING_FIX HUMAN_ERROR NO_LONGER_ACCEPTED_RISK OTHER "← Cancel" || return 0
+    [ "$UI_INDEX" -le 3 ] || return 0
+  else
+    ui_select "Reason (mute)" PENDING_FIX FALSE_POSITIVE NO_FIX DUPLICATE RISK_ACCEPTED OTHER "← Cancel" || return 0
+    [ "$UI_INDEX" -le 5 ] || return 0
+  fi
+  rs="$UI_VALUE"
+
+  local nmax; nmax="$(pick_count)"
+  ui_select "Target" \
+    "From the last list (${nmax:-0} rows)" \
+    "From query (type manually)" \
+    "← Cancel" || return 0
+
+  local extra=""
+  [ "$unmute" -eq 0 ] || extra="--unmute"
+
+  case "$UI_INDEX" in
+    0) if [ "${nmax:-0}" -eq 0 ]; then warn "List is empty."; pause; return 0; fi
+       ui_text "Selection (all / 3 / 1,4,9 / 2-10)" "all" || return 0
+       local sl="$UI_VALUE"
+       run_action cmd_mute_pick --select "$sl" --reason "$rs" $extra
+       ui_confirm "Run for real?" no \
+         && run_action cmd_mute_pick --select "$sl" --reason "$rs" $extra --apply ;;
+    1) ui_text "Finding query" "" || return 0
+       local mq="$UI_VALUE"
+       run_action cmd_mute --query "$mq" --reason "$rs" $extra
+       ui_confirm "Run for real?" no \
+         && run_action cmd_mute --query "$mq" --reason "$rs" $extra --apply ;;
+    *) return 0 ;;
+  esac
+  pause
+}
+
+menu_rules() {
+  while :; do
+    ui_select "Severity modifier rules" \
+      "List rule" \
+      "Create rule (set severity)" \
+      "Create rule (shift up/down)" \
+      "Delete rule" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) run_action cmd_rule_list; pause ;;
+      1|2) local mode="$UI_INDEX" act="" val=""
+         if [ "$mode" -eq 1 ]; then
+           ui_select "Severity target" info_none low medium high critical "← Cancel" || continue
+           [ "$UI_INDEX" -le 4 ] || continue
+           act="--to"; val="$UI_VALUE"
+         else
+           ui_select "Direction shift" up down "← Cancel" || continue
+           [ "$UI_INDEX" -le 1 ] || continue
+           act="--shift"; val="$UI_VALUE"
+         fi
+         ui_text "Rule name" "" || continue
+         local rn="$UI_VALUE"
+         ui_select "Finding type" \
+           static_code_vulnerability \
+           library_vulnerability \
+           secret \
+           iac_misconfiguration \
+           runtime_code_vulnerability \
+           "Type manually (several allowed, comma-separated)" \
+           "← Cancel" || continue
+         local rty=""
+         case "$UI_INDEX" in
+           5) ui_text "Finding types (comma)" "static_code_vulnerability" || continue; rty="$UI_VALUE" ;;
+           6) continue ;;
+           *) rty="$UI_VALUE" ;;
+         esac
+         ui_text "Query filter (empty = all)" "" ; local rq="$UI_VALUE"
+         ui_text "Description / reason (required)" "" || { warn "Reason required"; continue; }
+         local rd="$UI_VALUE"
+         run_action cmd_rule_create --name "$rn" "$act" "$val" --types "$rty" --query "$rq" --reason "$rd"
+         ui_confirm "Create rule '$rn'?" no \
+           && run_action cmd_rule_create --name "$rn" "$act" "$val" --types "$rty" --query "$rq" --reason "$rd" --apply
+         pause ;;
+      3) ui_text "Rule ID" "" || continue
+         local rdel="$UI_VALUE"
+         ui_confirm "DELETE rule $rdel?" no && run_action cmd_rule_delete --id "$rdel" --apply
+         pause ;;
+      4) return 0 ;;
+    esac
+  done
+}
+
+menu_work() {
+  while :; do
+    load_creds
+    ui_select "Work Management · active project: ${PROJECT_ID:-not selected}" \
+      "List work item" \
+      "Search work item (filter)" \
+      "View work item detail" \
+      "Post comment" \
+      "Change status" \
+      "Select active project" \
+      "List work type" \
+      "Doctor - why not all projects are readable" \
+      "Check access to one project by UUID" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) run_action cmd_work_list --limit 50; pause ;;
+      1) ui_text "Filter (free-text)" "" || continue
+         run_action cmd_work_list --filter "$UI_VALUE" --limit 50; pause ;;
+      2) ui_text "Work item key (e.g. SAST-142)" "" || continue
+         run_action cmd_work_view --key "$UI_VALUE"; pause ;;
+      3) ui_text "Work item key" "" || continue
+         local wk="$UI_VALUE"
+         ui_text "Comment" "" || continue
+         local wt="$UI_VALUE"
+         ui_confirm "Post comment to $wk?" no \
+           && run_action cmd_work_comment --key "$wk" --text "$wt" --apply
+         pause ;;
+      4) ui_text "Work item key" "" || continue
+         local sk="$UI_VALUE"
+         ui_text "Target status (must match exactly)" "" || continue
+         local st="$UI_VALUE"
+         run_action cmd_work_status --key "$sk" --to "$st"
+         ui_confirm "Change status $sk → $st?" no \
+           && run_action cmd_work_status --key "$sk" --to "$st" --apply
+         pause ;;
+      5) menu_work_project ;;
+      6) run_action cmd_work_types; pause ;;
+      7) ui_text "Project names you expect to exist (comma, empty = skip)" "" \
+           && run_action cmd_work_doctor --expect "$UI_VALUE" \
+           || run_action cmd_work_doctor
+         pause ;;
+      8) ui_text "Project UUID (from the URL in the UI)" "" || continue
+         run_action cmd_work_project_access --id "$UI_VALUE"; pause ;;
+      9) return 0 ;;
+    esac
+  done
+}
+
+# The project is picked from the API response, so a UUID never has to be typed
+# or pasted - which is where the last round of input bugs came from.
+menu_work_project() {
+  need_auth
+  local json; json="$(cases_projects_fetch)" || { pause; return 0; }
+  local n; n="$(printf '%s' "$json" | jq -r 'length')"
+  if [ "${n:-0}" -eq 0 ]; then
+    warn "No projects readable. Run Doctor to find out why."
+    pause; return 0
+  fi
+  local labels=() ids=() line pid pkey pname prest
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\x1f' read -r pid pkey pname prest <<< "${line//$'\t'/$'\x1f'}"
+    ids+=("$pid")
+    labels+=("$(printf '%-12s %-32.32s restricted=%s' "$pkey" "$pname" "$prest")")
+  done <<EOF
+$(printf '%s' "$json" | jq -r 'sort_by(.attributes.name // "") | .[]
+  | "\(.id)\t\(.attributes.key // "?")\t\(.attributes.name // "?")\t\((.attributes.restricted // false)|tostring)"')
+EOF
+  labels+=("← Cancel")
+  ui_select "Select active project ($n readable)" "${labels[@]}" || return 0
+  [ "$UI_INDEX" -lt "$n" ] || return 0
+  run_action cmd_work_use_project --id "${ids[$UI_INDEX]}"
+  pause
+}
+
+menu_session() {
+  while :; do
+    ui_select "Session" \
+      "Status" \
+      "Login / change credentials" \
+      "Probe permissions (all features)" \
+      "Logout (delete local credentials)" \
+      "← Back" || return 0
+    case "$UI_INDEX" in
+      0) run_action cmd_auth_status; pause ;;
+      1) run_action cmd_auth_login; pause ;;
+      2) run_action cmd_auth_probe; pause ;;
+      3) ui_confirm "Delete local credentials?" no && run_action cmd_auth_logout; pause ;;
+      4) return 0 ;;
+    esac
+  done
+}
+
+menu_report() {
+  local ext fmt
+  ui_select "Report format" \
+    "Markdown (.md)" \
+    "HTML (.html)" \
+    "JSON (.json)" \
+    "← Cancel" || return 0
+  case "$UI_INDEX" in
+    0) fmt=md;   ext=md ;;
+    1) fmt=html; ext=html ;;
+    2) fmt=json; ext=json ;;
+    *) return 0 ;;
+  esac
+
+  ui_text "Findings query" '@status:open' || return 0
+  local q="$UI_VALUE"
+  local args=(--format "$fmt" --query "$q")
+
+  ui_select "Destination" "Save to file" "Print to screen" "← Cancel" || return 0
+  case "$UI_INDEX" in
+    0) ui_text "Output file" "posture-report.$ext" || return 0; args+=(--out "$UI_VALUE") ;;
+    1) : ;;
+    *) return 0 ;;
+  esac
+
+  run_action cmd_report "${args[@]}"
+  pause
+}
+
+cmd_start() {
+  MENU_MODE=true
+  while :; do
+    banner
+    ui_select "Main menu" \
+      "Findings - list, filter, SAST violations" \
+      "Recast severity - pick / bulk / rule / mute" \
+      "Work Management - work items, comments, status" \
+      "Report - generate posture report (md/html/json)" \
+      "Session - login, status, permission probe" \
+      "Help" \
+      "Quit" || { info ""; ok "Bye"; return 0; }
+    case "$UI_INDEX" in
+      0) menu_findings ;;
+      1) menu_recast ;;
+      2) menu_work ;;
+      3) menu_report ;;
+      4) menu_session ;;
+      5) usage; pause ;;
+      6) info ""; ok "Bye"; return 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat >&2 <<'EOF'
+dd-sec - Datadog Security CLI (pure bash)
+
+  dd-sec start        interactive menu (↑/↓ move, Enter select, q cancel);
+                      authentication is requested when needed
+
+FINDINGS
+  findings list   [--query Q] [--limit N] [--json] [--export FILE.tsv]
+                  Results are NUMBERED and cached, so the next action uses
+                  the number, not the finding ID.
+  findings show N                    detail of row #N, including the full ID
+  findings keys   [--query Q]        show the real attribute layout;
+                                     use this if columns come out as "-"
+  sast list       [--repo NAME] [--repo-id HOST/PATH] [--branch B] [--sha SHA]
+                  [--from-git] [--all-categories]
+    No filter = org-wide. --repo tries @git.repository.name then automatically
+    falls back to a wildcard @git.repository.id:*NAME*, because repository.name
+    is not confirmed as a facet on the cicodescan track.
+  sast list ... [--days D]           lookback; default 30 days
+  sast repos      [DAYS]             repo identifiers PRESENT in the data (default 90d)
+  sast probe      [--repo N|--repo-id ID] [--branch B] [--days D]
+    Adds filters one at a time, printing the result count at each step. The
+    first one to become 0 is the cause. Use this when the result is 0.
+
+RECAST  (needs severity_mode=direct; check with auth probe)
+  recast pick     --select S --to SEV --reason R [--apply]
+    S = 3 | 1,4,9 | 2-10 | all | all,!7   (numbers from findings list)
+    This is the primary path: no ID to copy. Before apply, the selection
+    is re-verified against live data and shown by NAME.
+  recast one      --id ID --to SEV --reason R [--apply]
+  recast query    --query Q --to SEV --reason R [--limit N] [--apply]
+  recast bulk     --file F.csv|F.json [--apply]
+
+MUTE
+  mute pick       --select S --reason R [--unmute] [--apply]
+  mute            (--id ID | --query Q) --reason R [--unmute] [--apply]
+    mute   : PENDING_FIX FALSE_POSITIVE OTHER NO_FIX DUPLICATE RISK_ACCEPTED
+    unmute : NO_PENDING_FIX HUMAN_ERROR NO_LONGER_ACCEPTED_RISK OTHER
+
+RULES  (severity modifier rules API; always key-auth)
+  rule list
+  rule create     --name N (--to SEV | --shift up|down) --types T[,T]
+                  [--query Q] --reason R [--apply]
+  rule delete     --id RULE_ID [--apply]
+
+WORK MANAGEMENT
+  work list       [--filter F] [--limit N]
+  work view       --key KEY
+  work comment    --key KEY --text T [--apply]
+  work status     --key KEY --to STATUS [--apply]
+  work projects | work types | work use-project --id ID
+  work project-access --id UUID      read one project's restriction policy,
+                                     including projects that do not appear in the list
+                                     (take the UUID from the project URL in the UI)
+  work doctor     [--expect 'name1,name2']
+    Why the API returns fewer projects than the dashboard.
+    Checks app key identity, key scope, pagination, and restriction policy
+    per project.
+
+REPORT  (read-only; needs only *_read permissions)
+  report          [--query Q] [--days D] [--format md|html|json] [--out FILE]
+                  [--title T] [--top N] [--limit N] [--no-sast]
+    Point-in-time posture report: findings severity distribution, top findings,
+    and (when code_analysis_read is present) a SAST summary with top repos.
+    Markdown by default; HTML is a self-contained styled page; JSON is a
+    machine-readable summary. Writes to stdout unless --out is given.
+      report --format html --out posture.html
+      report --query '@status:open @severity:(high OR critical)' --days 90
+
+SESSION
+  auth login      [--mode browser|manual|env] [--site S] [--api-key K] [--app-key K]
+  auth status | auth probe | auth logout
+
+SEVERITY   info_none | low | medium | high | critical
+  Floor per finding type: static_code_vulnerability, secret,
+  iac_misconfiguration and runtime_code_vulnerability do not support
+  info_none (floor-nya low).
+
+DRY-RUN DEFAULT
+  All data-changing actions default to dry-run. --apply is required.
+  --reason is also required on every write: a recast without justification is an audit finding.
+
+FILE FORMAT (recast bulk)
+  TSV   from `findings list --export`. Header-mapped; extra columns
+        (current_severity, name, resource) carried for review and ignored.
+        an EMPTY target_severity = row skipped, no need to delete it.
+  CSV   finding_id,target_severity,reason     (positional; reason may contain commas)
+  JSON  [{"finding_id":"...","target_severity":"high","reason":"..."}]
+
+ENV
+  DD_API_KEY DD_APP_KEY DD_SITE
+  DD_CASES_PROJECT_ID   default Work Management project
+  DD_SEC_HOME           override config dir
+  DD_SEC_KEYSTORE       auto|keychain|secret|file
+  DD_SEC_NO_TUI         set to anything to disable the arrow-key menu and
+                        use numbered prompts (automatic when not a TTY)
+  SAST_QUERY_LIMIT      default 5000; the cicodescan endpoint is undocumented,
+                        the server ceiling is not guaranteed stable
+  SAST_LOOKBACK_DAYS    default 30
+  NO_COLOR
+EOF
+}
+
+# -----------------------------------------------------------------------------
+need_deps
+[ $# -gt 0 ] || { cmd_start; exit 0; }
+
+group="$1"; shift
+case "$group" in
+  start|menu|"") cmd_start ;;
+  auth)
+    sub="${1:-status}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      login) cmd_auth_login "$@" ;; status) cmd_auth_status "$@" ;;
+      logout) cmd_auth_logout "$@" ;; probe) cmd_auth_probe "$@" ;;
+      *) die "auth: unknown subcommand '$sub'" ;;
+    esac ;;
+  findings)
+    sub="${1:-list}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      list) cmd_findings_list "$@" ;;
+      show) cmd_findings_show "$@" ;;
+      keys) cmd_findings_keys "$@" ;;
+      *) die "findings: use list|show|keys" ;;
+    esac ;;
+  sast)
+    sub="${1:-list}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      list)  cmd_sast_list "$@" ;;
+      repos) cmd_sast_repos "$@" ;;
+      probe) cmd_sast_probe "$@" ;;
+      *) die "sast: use list|repos|probe" ;;
+    esac ;;
+  recast)
+    sub="${1:-}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      pick) cmd_recast_pick "$@" ;;
+      one) cmd_recast_one "$@" ;; query) cmd_recast_query "$@" ;;
+      bulk) cmd_recast_bulk "$@" ;;
+      *) die "recast: use pick|one|query|bulk" ;;
+    esac ;;
+  mute)
+    if [ "${1:-}" = "pick" ]; then shift; cmd_mute_pick "$@"; else cmd_mute "$@"; fi ;;
+  rule)
+    sub="${1:-list}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      list) cmd_rule_list "$@" ;; create) cmd_rule_create "$@" ;;
+      delete) cmd_rule_delete "$@" ;; *) die "rule: use list|create|delete" ;;
+    esac ;;
+  work)
+    sub="${1:-list}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      list) cmd_work_list "$@" ;; view) cmd_work_view "$@" ;;
+      comment) cmd_work_comment "$@" ;; status) cmd_work_status "$@" ;;
+      projects) cmd_work_projects "$@" ;; types) cmd_work_types "$@" ;;
+      use-project) cmd_work_use_project "$@" ;;
+      doctor) cmd_work_doctor "$@" ;;
+      project-access) cmd_work_project_access "$@" ;;
+      *) die "work: use list|view|comment|status|projects|types|use-project|doctor|project-access" ;;
+    esac ;;
+  report) cmd_report "$@" ;;
+  version|--version|-v) printf 'dd-sec %s\n' "$VERSION" ;;
+  help|--help|-h) usage ;;
+  *) die "Unknown command '$group'. See: $PROG help" ;;
+esac

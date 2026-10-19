@@ -1,0 +1,11 @@
+finding_id	target_severity	reason	current_severity	name	resource
+# This is the round-trip format produced by:  dd-sec findings list --export recast.tsv
+# Fill in target_severity and reason for the rows you want to change.
+# Rows with an EMPTY target_severity are skipped, so you don't need to delete them.
+# current_severity / name / resource are carried for your review and are ignored.
+# Then:
+#   dd-sec recast bulk --file recast.tsv            # dry-run
+#   dd-sec recast bulk --file recast.tsv --apply    # execute
+# (Lines starting with # are illustrative; a real export has no comment lines.)
+EXAMPLEID0000000000000000000000000000001	low	accepted risk, ticket SEC-123	high	Hardcoded secret in config	svc-payments
+EXAMPLEID0000000000000000000000000000002		leave this one unchanged	medium	Weak cipher	svc-auth
