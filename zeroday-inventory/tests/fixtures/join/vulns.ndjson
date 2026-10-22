@@ -1,0 +1,1 @@
+{"asset_name":"github.com/acme/webapp","asset_type":"Repository","repo":"github.com/acme/webapp","package":"next","version":"14.2.1","cve_ids":["CVE-2025-1234"],"severity":"high","fix_version":"14.2.5","prog_lang":"JavaScript/TypeScript","data_source":"vulns"}

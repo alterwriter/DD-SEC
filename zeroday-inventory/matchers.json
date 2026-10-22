@@ -1,0 +1,42 @@
+{
+  "_comment": "Package matchers for zeroday.sh. purl prefixes match case-insensitively against CycloneDX component purls. JS entries end with '@' so they match the EXACT package name (pkg:npm/<name>@<version>) and do NOT over-match lookalikes (e.g. 'pkg:npm/react@' matches react but not react-is / react-dom / react-router). PHP matches any composer package by design.",
+  "js": {
+    "prog_lang": "JavaScript/TypeScript",
+    "purl_prefixes": [
+      "pkg:npm/next@",
+      "pkg:npm/nuxt@",
+      "pkg:npm/nuxt3@",
+      "pkg:npm/@nuxt/",
+      "pkg:npm/%40nuxt/",
+      "pkg:npm/react@",
+      "pkg:npm/react-dom@",
+      "pkg:npm/react-server-dom-webpack@",
+      "pkg:npm/react-server-dom-parcel@",
+      "pkg:npm/react-server-dom-turbopack@"
+    ],
+    "frameworks": {
+      "Next.js": ["pkg:npm/next@"],
+      "Nuxt": ["pkg:npm/nuxt@", "pkg:npm/nuxt3@", "pkg:npm/@nuxt/", "pkg:npm/%40nuxt/"],
+      "React": ["pkg:npm/react@", "pkg:npm/react-dom@", "pkg:npm/react-server-dom-"]
+    }
+  },
+  "php": {
+    "prog_lang": "PHP",
+    "purl_prefixes": [
+      "pkg:composer/"
+    ],
+    "host_runtime_prefixes": [
+      "pkg:deb/",
+      "pkg:rpm/",
+      "pkg:apk/"
+    ],
+    "host_runtime_name_glob": "php",
+    "frameworks": {
+      "Laravel": ["pkg:composer/laravel/framework"],
+      "Symfony": ["pkg:composer/symfony/"],
+      "CodeIgniter": ["pkg:composer/codeigniter4/framework"],
+      "Yii": ["pkg:composer/yiisoft/yii2"],
+      "CakePHP": ["pkg:composer/cakephp/cakephp"]
+    }
+  }
+}

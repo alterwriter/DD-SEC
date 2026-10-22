@@ -1,0 +1,2 @@
+{"repo":"github.com/acme/webapp","purl":"pkg:npm/next@14.2.1","package":"next","version":"14.2.1","framework":"Next.js","prog_lang":"JavaScript/TypeScript","data_source":"sbom_repo"}
+{"repo":"github.com/acme/legacy","purl":"pkg:npm/react@18.2.0","package":"react","version":"18.2.0","framework":"React","prog_lang":"JavaScript/TypeScript","data_source":"sbom_repo"}

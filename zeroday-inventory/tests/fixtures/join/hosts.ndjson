@@ -1,0 +1,2 @@
+{"hostname":"host-1","aliases":["i-123"],"ips":["10.0.0.5","10.0.0.6"],"data_source":"hosts"}
+{"hostname":"host-2","aliases":[],"ips":["10.0.0.9"],"data_source":"hosts"}
